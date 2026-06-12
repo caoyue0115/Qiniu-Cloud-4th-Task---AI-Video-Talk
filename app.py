@@ -1,260 +1,147 @@
-"""
-AI视觉对话助手 - 主程序
-面向视障人士的AI视觉助手
-技术栈：Gradio + 阿里云通义千问
-"""
+"""AI 视觉对话助手 —— 面向视障人士的语音视觉助手。
 
-import os
-import tempfile
+核心闭环：语音输入 → 视觉理解 → 语音输出
+端云协同：颜色识别走端侧；简单问题走小模型；复杂场景走大模型；命中缓存零成本。
+
+运行：
+    1. 复制 .env.example 为 .env，填入你的 DASHSCOPE_API_KEY
+    2. pip install -r requirements.txt
+    3. python app.py
+"""
+import sys
+import hashlib
+
+# Windows 控制台默认 GBK，强制 UTF-8 避免中文/emoji 打印崩溃
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 import gradio as gr
-from dotenv import load_dotenv
 
-from utils.vision import (
-    compress_image, detect_color, image_to_base64,
-    is_color_question, is_obstacle_question
-)
-from utils.ai_service import AIService
-from utils.cost_tracker import CostTracker
+from utils import config
+from modules.vision import VisionModule
+from modules.speech import SpeechModule
+from modules.color_detector import ColorDetector
+from modules.router import ModelRouter
+from modules.cache import ResponseCache
+from modules.cost_tracker import CostTracker
+from modules.context import ConversationContext
 
-# 加载环境变量
-load_dotenv()
-
-# ============================================================
-# 初始化
-# ============================================================
-try:
-    ai_service = AIService(api_key=os.getenv("DASHSCOPE_API_KEY"))
-except ValueError as e:
-    print(f"⚠️ {e}")
-    print("⚠️ 请在项目根目录创建 .env 文件，添加: DASHSCOPE_API_KEY=sk-xxx")
-    ai_service = None
-
+vision = VisionModule()
+speech = SpeechModule()
+color_detector = ColorDetector()
+router = ModelRouter()
+cache = ResponseCache()
 cost_tracker = CostTracker()
-
-# 全局状态
-current_frame = None
-conversation_history = []
+context = ConversationContext()
 
 
-# ============================================================
-# 核心处理函数
-# ============================================================
+def _image_fingerprint(image) -> str:
+    if image is None:
+        return "none"
+    small = image[::16, ::16]  # 降采样后做指纹，相近画面命中同一缓存
+    return hashlib.md5(small.tobytes()).hexdigest()[:16]
 
-def process_question(video_frame, audio_file, question_text):
-    """
-    处理用户的问题
-    流程：获取帧 → 语音识别 → 判断问题类型 → 端侧/云端处理 → TTS → 返回
-    """
-    global current_frame, conversation_history
 
-    # 1. 检查摄像头
-    if video_frame is None:
-        return "⚠️ 请先打开摄像头", None, conversation_history, cost_tracker.get_stats_markdown()
+def process_request(audio, image):
+    """核心处理函数。返回 (回答文本, 语音输出, 成本报告)。"""
+    cost_tracker.new_request()
 
-    # 2. 压缩当前帧
-    current_frame = compress_image(video_frame)
-
-    # 3. 获取用户输入
-    user_text = None
-
-    if audio_file is not None:
-        # 语音转文字
-        if ai_service:
-            user_text = ai_service.transcribe_audio(audio_file)
-            cost_tracker.add_call("paraformer")
-        else:
-            return "⚠️ AI服务未配置，请设置API Key", None, conversation_history, cost_tracker.get_stats_markdown()
-
-    if not user_text and question_text and question_text.strip():
-        user_text = question_text.strip()
-
+    # 1. 语音转文字
+    user_text = speech.transcribe(audio) if audio is not None else ""
+    if audio is not None:
+        cost_tracker.log("asr")
     if not user_text:
-        return "请说话或输入文字", None, conversation_history, cost_tracker.get_stats_markdown()
+        msg = "我没有听清，请再说一次。"
+        return msg, speech.synthesize(msg), cost_tracker.get_report()
 
-    # 4. 判断问题类型，选择处理策略（端云协同）
-    answer = None
+    context.add("user", user_text)
 
-    if is_color_question(user_text):
-        # 端侧处理：颜色识别（成本=0）
-        color = detect_color(current_frame)
-        answer = f"我看到的是{color}。"
-        cost_tracker.add_call("qwen_vl", cost=0)  # 端侧处理，成本为0
+    # 2. 检查缓存
+    cache_key = ResponseCache.make_key(user_text, _image_fingerprint(image))
+    cached = cache.get(cache_key)
+    if cached:
+        cost_tracker.log("cache_hit")
+        context.add("assistant", cached)
+        return cached, speech.synthesize(cached), cost_tracker.get_report()
 
-    elif is_obstacle_question(user_text):
-        # 云端处理：障碍物检测（需要视觉理解）
-        if ai_service:
-            answer = ai_service.analyze_image(current_frame, user_text)
-            cost_tracker.add_call("qwen_vl")
-        else:
-            answer = "障碍物检测需要AI服务支持"
+    # 3. 路由：判断走哪条路径
+    route = router.classify(user_text)
 
-    else:
-        # 云端处理：通用视觉理解
-        if ai_service:
-            answer = ai_service.analyze_image(current_frame, user_text)
-            cost_tracker.add_call("qwen_vl")
-        else:
-            answer = "AI服务未配置"
+    if route == "color":
+        result = color_detector.detect(image)
+        cost_tracker.log("edge")
+    elif route == "text":
+        result = vision.identify(image, user_text, model="mini")
+        cost_tracker.log("mini")
+    elif route == "simple":
+        result = vision.identify(image, user_text, model="mini")
+        cost_tracker.log("mini")
+    else:  # complex
+        result = vision.identify(image, user_text, model="full")
+        cost_tracker.log("full")
 
-    # 5. 语音合成
-    audio_response = None
-    if ai_service and answer:
-        audio_data = ai_service.text_to_speech(answer)
-        cost_tracker.add_call("cosyvoice")
-        if audio_data:
-            # 保存为临时文件
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-                f.write(audio_data)
-                audio_response = f.name
+    # 4. 写入缓存 + 上下文
+    cache.set(cache_key, result)
+    context.add("assistant", result)
+    context.set_image_desc(result)
 
-    # 6. 更新对话历史
-    conversation_history.append({"role": "user", "content": user_text})
-    conversation_history.append({"role": "assistant", "content": answer})
+    # 5. 文字转语音
+    audio_output = speech.synthesize(result)
+    cost_tracker.log("tts")
 
-    # 7. 格式化对话历史用于显示
-    display_history = []
-    for msg in conversation_history:
-        if msg["role"] == "user":
-            display_history.append(f"🧑 你：{msg['content']}")
-        else:
-            display_history.append(f"🤖 AI：{msg['content']}")
-
-    return answer, audio_response, display_history, cost_tracker.get_stats_markdown()
+    return result, audio_output, cost_tracker.get_report()
 
 
-def clear_conversation():
-    """清除对话历史"""
-    global conversation_history
-    conversation_history = []
-    if ai_service:
-        ai_service.clear_history()
-    return [], "对话已清除", cost_tracker.get_stats_markdown()
+def build_ui():
+    with gr.Blocks(title="AI 视觉对话助手", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(
+            "# 👁️ AI 视觉对话助手 —— 你的眼睛，随时在线\n"
+            "面向视障人士：**说出问题** + **对准摄像头**，AI 帮你「看」世界。\n"
+            "支持物体识别、颜色辨别、文字阅读、场景描述、验证码识别。"
+        )
 
-
-# ============================================================
-# Gradio 界面
-# ============================================================
-
-CUSTOM_CSS = """
-.gr-box { border-radius: 10px; }
-h1 { text-align: center; }
-"""
-
-with gr.Blocks(
-    title="AI视觉对话助手",
-    theme=gr.themes.Soft(),
-    css=CUSTOM_CSS
-) as demo:
-    # 标题
-    gr.Markdown(
-        """
-        # 👁️ AI视觉对话助手
-        ### 面向视障人士 — 用语音与AI对话，让AI帮你"看"世界
-        """
-    )
-
-    with gr.Row():
-        # 左列：输入区
-        with gr.Column(scale=1):
-            gr.Markdown("### 📷 摄像头")
-            video = gr.Image(
-                sources=["webcam"],
-                streaming=True,
-                label="摄像头画面",
-                height=400
+        if not config.ensure_api_key():
+            gr.Markdown(
+                "⚠️ **未检测到有效的 DASHSCOPE_API_KEY**。"
+                "请复制 `.env.example` 为 `.env` 并填入你的阿里云百炼 API Key 后重启。"
             )
 
-            gr.Markdown("### 🎤 语音输入")
-            audio = gr.Audio(
-                sources=["microphone"],
-                type="filepath",
-                label="点击录音后提问"
-            )
+        with gr.Row():
+            with gr.Column():
+                audio_input = gr.Audio(
+                    sources=["microphone"], type="numpy", label="🎤 说出你的问题"
+                )
+                camera = gr.Image(
+                    sources=["webcam"], type="numpy", label="📷 摄像头画面"
+                )
+                submit_btn = gr.Button("🚀 开始识别", variant="primary")
 
-            gr.Markdown("### ⌨️ 文字输入（备选）")
-            text_input = gr.Textbox(
-                label="文字输入",
-                placeholder="或者在这里打字提问...",
-                lines=2
-            )
+            with gr.Column():
+                text_output = gr.Textbox(label="💬 AI 回答", lines=4)
+                audio_output = gr.Audio(label="🔊 语音播报", autoplay=True)
+                cost_display = gr.Textbox(label="📊 成本统计", lines=12)
 
-            with gr.Row():
-                submit_btn = gr.Button("🎤 提问", variant="primary", size="lg")
-                clear_btn = gr.Button("🗑️ 清除对话", size="lg")
+        gr.Markdown(
+            "### 试试这些问法\n"
+            "- 「这是什么颜色」→ 端侧处理，零成本\n"
+            "- 「这是什么」「这是什么药」→ 小模型\n"
+            "- 「帮我看看周围」「前面有障碍物吗」→ 大模型\n"
+            "- 「这上面写了什么」「帮我读验证码」→ 文字识别"
+        )
 
-        # 右列：输出区
-        with gr.Column(scale=1):
-            gr.Markdown("### 💬 AI回答")
-            answer_text = gr.Textbox(
-                label="回答文字",
-                lines=4,
-                placeholder="AI的回答将显示在这里..."
-            )
+        submit_btn.click(
+            fn=process_request,
+            inputs=[audio_input, camera],
+            outputs=[text_output, audio_output, cost_display],
+        )
 
-            gr.Markdown("### 🔊 语音回答")
-            audio_output = gr.Audio(
-                label="点击播放",
-                type="filepath",
-                autoplay=True
-            )
+    return demo
 
-            gr.Markdown("### 📝 对话历史")
-            history = gr.Chatbot(
-                label="对话记录",
-                height=350,
-                bubble_full_width=False
-            )
-
-            gr.Markdown("### 📊 成本统计")
-            cost_display = gr.Markdown(
-                cost_tracker.get_stats_markdown()
-            )
-
-    # 事件绑定
-    submit_btn.click(
-        fn=process_question,
-        inputs=[video, audio, text_input],
-        outputs=[answer_text, audio_output, history, cost_display]
-    )
-
-    clear_btn.click(
-        fn=clear_conversation,
-        inputs=[],
-        outputs=[history, answer_text, cost_display]
-    )
-
-    # 底部信息
-    gr.Markdown(
-        """
-        ---
-        **提示**：
-        - 支持的问题：物品识别、颜色识别、障碍物检测、文字阅读等
-        - 颜色识别在本地处理（免费），其他问题调用云端AI
-        - 建议在光线充足的环境下使用
-        - 本应用为实训Demo，不构成医疗建议
-        """
-    )
-
-
-# ============================================================
-# 启动
-# ============================================================
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("  AI视觉对话助手 启动中...")
-    print("  技术栈：Gradio + 阿里云通义千问")
-    print("=" * 50)
-    print()
-    print("  🌐 本地访问: http://localhost:7860")
-    print("  🌍 公网访问: 启动后查看 Gradio 生成的链接")
-    print()
-    print("  按 Ctrl+C 停止服务")
-    print("=" * 50)
-
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=True,  # 生成公网链接
-        debug=False
-    )
+    app = build_ui()
+    app.launch(share=False, inbrowser=True)
