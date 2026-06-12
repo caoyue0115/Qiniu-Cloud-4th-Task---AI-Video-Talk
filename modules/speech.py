@@ -97,6 +97,38 @@ class SpeechModule:
                 except OSError:
                     pass
 
+    def transcribe_wav_bytes(self, wav_bytes: bytes) -> str:
+        """语音转文字，直接接收 WAV 字节（供 FastAPI HTTP 服务用）。
+
+        浏览器上传的 WAV 已是 16k 单声道（前端封装），写临时文件后识别。
+        """
+        if not wav_bytes:
+            return ""
+        path = None
+        try:
+            from dashscope.audio.asr import Recognition
+
+            fd, path = tempfile.mkstemp(suffix=".wav")
+            with os.fdopen(fd, "wb") as f:
+                f.write(wav_bytes)
+            recognition = Recognition(
+                model=self.asr_model,
+                format="wav",
+                sample_rate=ASR_SAMPLE_RATE,
+                callback=None,
+            )
+            result = recognition.call(path)
+            return _parse_asr_result(result)
+        except Exception as e:
+            print(f"[ASR error] {e}")
+            return ""
+        finally:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
     def synthesize(self, text: str):
         """文字转语音，返回 (sample_rate, ndarray) 供 Gradio 播放。失败返回 None。"""
         if not text:
@@ -110,6 +142,20 @@ class SpeechModule:
                 return None
             data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
             return (sr, data)
+        except Exception as e:
+            print(f"[TTS error] {e}")
+            return None
+
+    def synthesize_bytes(self, text: str):
+        """文字转语音，返回原始音频字节（MP3，供 HTTP 直接回传播放）。失败返回 None。"""
+        if not text:
+            return None
+        try:
+            from dashscope.audio.tts_v2 import SpeechSynthesizer
+
+            synthesizer = SpeechSynthesizer(model=self.tts_model, voice=self.tts_voice)
+            audio_bytes = synthesizer.call(text)
+            return audio_bytes or None
         except Exception as e:
             print(f"[TTS error] {e}")
             return None

@@ -38,6 +38,16 @@ cache = ResponseCache()
 cost_tracker = CostTracker()
 context = ConversationContext()
 
+# 摄像头最新帧：webcam 流式持续更新，提问时读取，避免"忘记按快门"导致 image 为空
+_latest_frame = {"img": None}
+
+
+def update_frame(frame):
+    """webcam stream 回调：缓存最新一帧。"""
+    if frame is not None:
+        _latest_frame["img"] = frame
+    return None
+
 
 def _image_fingerprint(image) -> str:
     if image is None:
@@ -46,18 +56,31 @@ def _image_fingerprint(image) -> str:
     return hashlib.md5(small.tobytes()).hexdigest()[:16]
 
 
-def process_request(audio, image):
-    """核心处理函数。返回 (回答文本, 语音输出, 成本报告)。"""
+def process_request(audio, image, typed_text=""):
+    """核心处理函数。返回 (识别到的问题, 回答文本, 语音输出, 成本报告)。
+
+    audio: 麦克风输入；typed_text: 文字输入（麦克风不可用时的备选）。
+    两者都可触发；优先用语音，没有语音再用文字。
+    """
     cost_tracker.new_request()
 
-    # 1. 语音转文字
-    user_text = speech.transcribe(audio) if audio is not None else ""
-    if audio is not None:
-        cost_tracker.log("asr")
-    if not user_text:
-        msg = "我没有听清，请再说一次。"
-        return msg, speech.synthesize(msg), cost_tracker.get_report()
+    # 0. 取画面：优先用传入的 image，没有则用 webcam 流式缓存的最新帧
+    if image is None:
+        image = _latest_frame["img"]
 
+    # 1. 获取用户问题：优先语音识别，其次文字输入
+    user_text = ""
+    if audio is not None:
+        user_text = speech.transcribe(audio)
+        cost_tracker.log("asr")
+    if not user_text and typed_text:
+        user_text = typed_text.strip()
+
+    if not user_text:
+        msg = "我没有听清，请再说一次，或在下方文字框输入问题。"
+        return "（未识别到问题）", msg, speech.synthesize(msg), cost_tracker.get_report()
+
+    heard = f"🗣️ 我听到：{user_text}"
     context.add("user", user_text)
 
     # 2. 检查缓存
@@ -66,7 +89,7 @@ def process_request(audio, image):
     if cached:
         cost_tracker.log("cache_hit")
         context.add("assistant", cached)
-        return cached, speech.synthesize(cached), cost_tracker.get_report()
+        return heard, cached, speech.synthesize(cached), cost_tracker.get_report()
 
     # 3. 路由：判断走哪条路径
     route = router.classify(user_text)
@@ -93,11 +116,11 @@ def process_request(audio, image):
     audio_output = speech.synthesize(result)
     cost_tracker.log("tts")
 
-    return result, audio_output, cost_tracker.get_report()
+    return heard, result, audio_output, cost_tracker.get_report()
 
 
 def build_ui():
-    with gr.Blocks(title="AI 视觉对话助手", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="AI 视觉对话助手") as demo:
         gr.Markdown(
             "# 👁️ AI 视觉对话助手 —— 你的眼睛，随时在线\n"
             "面向视障人士：**说出问题** + **对准摄像头**，AI 帮你「看」世界。\n"
@@ -113,14 +136,20 @@ def build_ui():
         with gr.Row():
             with gr.Column():
                 audio_input = gr.Audio(
-                    sources=["microphone"], type="numpy", label="🎤 说出你的问题"
+                    sources=["microphone"], type="numpy", label="🎤 说出你的问题（录完会自动识别）"
                 )
                 camera = gr.Image(
-                    sources=["webcam"], type="numpy", label="📷 摄像头画面"
+                    sources=["webcam"], type="numpy", streaming=True,
+                    label="📷 摄像头画面（自动捕捉，无需拍照）"
+                )
+                typed_text = gr.Textbox(
+                    label="⌨️ 或在这里打字提问（麦克风不便时用）",
+                    placeholder="例如：这是什么颜色 / 这是什么 / 帮我看看周围",
                 )
                 submit_btn = gr.Button("🚀 开始识别", variant="primary")
 
             with gr.Column():
+                heard_output = gr.Textbox(label="🗣️ 识别到的问题", lines=1)
                 text_output = gr.Textbox(label="💬 AI 回答", lines=4)
                 audio_output = gr.Audio(label="🔊 语音播报", autoplay=True)
                 cost_display = gr.Textbox(label="📊 成本统计", lines=12)
@@ -130,13 +159,39 @@ def build_ui():
             "- 「这是什么颜色」→ 端侧处理，零成本\n"
             "- 「这是什么」「这是什么药」→ 小模型\n"
             "- 「帮我看看周围」「前面有障碍物吗」→ 大模型\n"
-            "- 「这上面写了什么」「帮我读验证码」→ 文字识别"
+            "- 「这上面写了什么」「帮我读验证码」→ 文字识别\n\n"
+            "> 💡 用法：先**允许浏览器使用摄像头和麦克风**，对准物品，"
+            "点麦克风录音说话，**停止录音后会自动识别**；也可以直接打字提问。"
         )
 
+        outputs = [heard_output, text_output, audio_output, cost_display]
+
+        # 摄像头流式持续更新最新帧（关键：避免用户忘记按快门导致画面为空）
+        camera.stream(
+            fn=update_frame,
+            inputs=[camera],
+            outputs=None,
+            stream_every=0.5,
+            show_progress="hidden",
+        )
+
+        # 录音停止后自动触发识别（对视障用户更友好，无需找按钮）
+        audio_input.stop_recording(
+            fn=process_request,
+            inputs=[audio_input, camera, typed_text],
+            outputs=outputs,
+        )
+        # 文字框回车提交
+        typed_text.submit(
+            fn=process_request,
+            inputs=[audio_input, camera, typed_text],
+            outputs=outputs,
+        )
+        # 按钮手动触发（备选）
         submit_btn.click(
             fn=process_request,
-            inputs=[audio_input, camera],
-            outputs=[text_output, audio_output, cost_display],
+            inputs=[audio_input, camera, typed_text],
+            outputs=outputs,
         )
 
     return demo
@@ -144,4 +199,4 @@ def build_ui():
 
 if __name__ == "__main__":
     app = build_ui()
-    app.launch(share=False, inbrowser=True)
+    app.launch(share=False, inbrowser=True, theme=gr.themes.Soft())

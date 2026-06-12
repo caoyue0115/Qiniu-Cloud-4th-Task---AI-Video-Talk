@@ -11,8 +11,11 @@ def numpy_to_pil(image: np.ndarray) -> Image.Image:
     return Image.fromarray(image)
 
 
-def encode_image_to_base64(image: np.ndarray, max_size: int = 720, quality: int = 80) -> str:
-    """压缩并编码为 base64 data URI。成本优化：限制分辨率与质量。"""
+def encode_image_to_base64(image: np.ndarray, max_size: int = 512, quality: int = 72) -> str:
+    """压缩并编码为 base64 data URI。成本+速度优化：限制分辨率与质量。
+
+    512px/q72 在视障识别场景下精度损失可忽略，但上传与模型处理明显更快。
+    """
     pil_img = numpy_to_pil(image)
     w, h = pil_img.size
     if max(w, h) > max_size:

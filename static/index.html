@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>AI 视觉对话助手 · 你的眼睛随时在线</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; overflow: hidden; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
+
+  /* ===== 开机星空画面 ===== */
+  #startup {
+    position: fixed; inset: 0;
+    background: radial-gradient(ellipse at bottom, #1b2735 0%, #090a0f 100%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    z-index: 10; transition: opacity 0.6s;
+  }
+  #stars, #stars2, #stars3 { position: absolute; inset: 0; }
+  .star {
+    position: absolute; background: #fff; border-radius: 50%;
+    animation: twinkle var(--dur) infinite ease-in-out alternate;
+  }
+  @keyframes twinkle { from { opacity: 0.15; } to { opacity: 1; } }
+
+  .startup-title {
+    color: #fff; font-size: 2.0rem; font-weight: 300; letter-spacing: 4px;
+    margin-bottom: 0.6rem; text-shadow: 0 0 24px rgba(120,170,255,.6); z-index: 2; text-align: center;
+  }
+  .startup-sub {
+    color: #9fb4d8; font-size: 1.0rem; letter-spacing: 2px; margin-bottom: 3rem; z-index: 2; text-align: center;
+  }
+  #call-btn {
+    width: 150px; height: 150px; border-radius: 50%; border: none; cursor: pointer; z-index: 2;
+    background: linear-gradient(145deg, #2ecc71, #27ae60);
+    color: #fff; font-size: 1.3rem; letter-spacing: 2px;
+    box-shadow: 0 0 0 0 rgba(46,204,113,.7); animation: pulse 2s infinite;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+  }
+  #call-btn .icon { font-size: 2.6rem; }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(46,204,113,.6); }
+    70% { box-shadow: 0 0 0 32px rgba(46,204,113,0); }
+    100% { box-shadow: 0 0 0 0 rgba(46,204,113,0); }
+  }
+
+  /* ===== 通话画面 ===== */
+  #call { position: fixed; inset: 0; background: #000; display: none; z-index: 5; }
+  #video { width: 100%; height: 100%; object-fit: cover; }
+
+  #status-bar {
+    position: fixed; top: 0; left: 0; right: 0; padding: 16px;
+    display: flex; align-items: center; gap: 12px; z-index: 6;
+    background: linear-gradient(180deg, rgba(0,0,0,.55), transparent); color: #fff;
+  }
+  #status-dot { width: 14px; height: 14px; border-radius: 50%; background: #2ecc71; flex-shrink: 0; }
+  #status-text { font-size: 1.05rem; letter-spacing: 1px; }
+
+  #answer-box {
+    position: fixed; left: 16px; right: 16px; bottom: 150px; z-index: 6;
+    background: rgba(0,0,0,.55); color: #fff; border-radius: 16px; padding: 16px 18px;
+    font-size: 1.15rem; line-height: 1.6; max-height: 40vh; overflow-y: auto;
+    backdrop-filter: blur(6px); display: none;
+  }
+  #answer-box .heard { color: #8fd0ff; font-size: 0.95rem; margin-bottom: 6px; }
+
+  #hangup-btn {
+    position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%); z-index: 7;
+    width: 84px; height: 84px; border-radius: 50%; border: none; cursor: pointer;
+    background: #e74c3c; color: #fff; font-size: 2.0rem;
+    box-shadow: 0 6px 24px rgba(231,76,60,.5);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #hangup-btn:active { transform: translateX(-50%) scale(0.92); }
+
+  #cost-toggle {
+    position: fixed; top: 16px; right: 16px; z-index: 8;
+    background: rgba(0,0,0,.5); color: #cfe3ff; border: 1px solid rgba(255,255,255,.2);
+    border-radius: 10px; padding: 6px 12px; font-size: 0.85rem; cursor: pointer;
+  }
+  #cost-panel {
+    position: fixed; top: 56px; right: 16px; z-index: 8; display: none;
+    background: rgba(0,0,0,.75); color: #cfe3ff; border-radius: 12px; padding: 14px 16px;
+    font-size: 0.82rem; white-space: pre-wrap; font-family: monospace; max-width: 80vw;
+  }
+
+  #permission-hint {
+    position: fixed; inset: 0; background: rgba(0,0,0,.85); color: #fff; z-index: 20;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    padding: 30px; text-align: center; font-size: 1.1rem; line-height: 1.8;
+  }
+  #permission-hint button {
+    margin-top: 24px; padding: 14px 30px; border-radius: 12px; border: none;
+    background: #3498db; color: #fff; font-size: 1.1rem; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+
+<!-- 开机星空画面 -->
+<div id="startup">
+  <div id="stars"></div>
+  <div id="stars2"></div>
+  <div id="stars3"></div>
+  <div class="startup-title">假如给我三天光明</div>
+  <div class="startup-sub">让 AI 成为你的眼睛 · 随时在线</div>
+  <button id="call-btn">
+    <span class="icon">📞</span>
+    <span>接通</span>
+  </button>
+</div>
+
+<!-- 通话画面 -->
+<div id="call">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="status-bar">
+    <div id="status-dot"></div>
+    <div id="status-text">正在聆听…请说出你的问题</div>
+  </div>
+  <button id="cost-toggle">成本</button>
+  <div id="cost-panel"></div>
+  <div id="answer-box"></div>
+  <button id="hangup-btn" title="挂断">📵</button>
+</div>
+
+<!-- 权限提示 -->
+<div id="permission-hint">
+  <div id="permission-msg"></div>
+  <button onclick="location.reload()">重新尝试</button>
+</div>
+
+<audio id="tts-player"></audio>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
