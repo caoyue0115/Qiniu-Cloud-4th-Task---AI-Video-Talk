@@ -28,7 +28,7 @@ class VisionModule:
             "mini": config.VISION_MODEL_MINI,
         }
 
-    def _build_messages(self, frames, user_text):
+    def _build_messages(self, frames, user_text, system_prompt=None):
         content = [{"image": encode_image_to_base64(f)} for f in frames]
         if len(frames) > 1:
             content.append({
@@ -38,9 +38,38 @@ class VisionModule:
         else:
             content.append({"text": user_text or "请描述你看到的内容。"})
         return [
-            {"role": "system", "content": [{"text": SYSTEM_PROMPT}]},
+            {"role": "system", "content": [{"text": system_prompt or SYSTEM_PROMPT}]},
             {"role": "user", "content": content},
         ]
+
+    def describe(self, image, user_text: str, system_prompt: str, model: str = "mini",
+                 max_tokens: int = MAX_TOKENS) -> str:
+        """用自定义 system prompt 描述画面（供导航/阅读/聊天等模式使用）。"""
+        if image is None:
+            return ""
+        frames = image if isinstance(image, list) else [image]
+        frames = [f for f in frames if f is not None]
+        if not frames:
+            return ""
+        messages = self._build_messages(frames, user_text, system_prompt=system_prompt)
+        try:
+            response = MultiModalConversation.call(
+                model=self.models.get(model, self.models["mini"]),
+                messages=messages,
+                api_key=config.DASHSCOPE_API_KEY,
+                max_tokens=max_tokens,
+            )
+        except Exception as e:
+            return f"识别出错了：{e}"
+        if response.status_code != 200:
+            return ""
+        try:
+            content = response.output.choices[0].message.content
+            if isinstance(content, list):
+                return "".join(c.get("text", "") for c in content if isinstance(c, dict)).strip()
+            return str(content).strip()
+        except (AttributeError, IndexError, KeyError):
+            return ""
 
     def identify(self, image, user_text: str, model: str = "mini") -> str:
         """识别图像内容并结合用户问题回答。
