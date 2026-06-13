@@ -16,6 +16,8 @@
 import sys
 import base64
 import io
+import asyncio
+import queue as _queue
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -40,7 +42,7 @@ from modules.router import ModelRouter
 from modules.cache import ResponseCache
 from modules.cost_tracker import CostTracker
 from modules.context import ConversationContext
-from modules.mode_prompts import MODE_PROMPTS, detect_mode_command
+from modules.mode_prompts import MODE_PROMPTS, detect_mode_command, OMNI_INSTRUCTIONS
 from modules.asr_stream import StreamingASR
 
 vision = VisionModule()
@@ -391,6 +393,102 @@ async def ws_asr(ws: WebSocket):
                 asr.finish()
             except Exception:
                 pass
+
+
+@app.websocket("/ws/realtime")
+async def ws_realtime(ws: WebSocket):
+    """实时模式：浏览器 ↔ 本服务 ↔ 通义千问 Omni-Realtime 的 WebSocket 中继。
+
+    浏览器持续发送 {type:'audio'|'video', data:<base64>} 与控制消息；
+    服务端转发给 Omni（输入 16k PCM、JPEG 帧），并把 Omni 的流式
+    文字/音频/转写事件回传浏览器。API Key 只在服务端，不暴露给前端。
+    """
+    from dashscope.audio.qwen_omni import (
+        OmniRealtimeConversation, OmniRealtimeCallback, MultiModality, AudioFormat)
+
+    await ws.accept()
+    outq = _queue.Queue()      # Omni 回调线程 → 浏览器（线程安全）
+    state = {"closed": False}
+
+    class CB(OmniRealtimeCallback):
+        def on_open(self):
+            outq.put({"type": "ready"})
+        def on_close(self, *a):
+            outq.put({"type": "omni_closed"})
+        def on_event(self, e):
+            et = e.get("type", "")
+            if et == "response.audio.delta":
+                outq.put({"type": "audio", "data": e.get("delta", "")})
+            elif et == "response.audio_transcript.delta":
+                outq.put({"type": "ai_text", "delta": e.get("delta", "")})
+            elif et == "conversation.item.input_audio_transcription.completed":
+                outq.put({"type": "user_text", "text": e.get("transcript", "")})
+            elif et == "input_audio_buffer.speech_started":
+                outq.put({"type": "user_speaking"})   # 用户开口 → 前端可停播打断
+            elif et == "response.done":
+                outq.put({"type": "done"})
+            elif "error" in et.lower():
+                outq.put({"type": "error", "message": str(e.get("error", e))})
+
+    async def drain():
+        while not state["closed"]:
+            sent = False
+            try:
+                while True:
+                    await ws.send_json(outq.get_nowait())
+                    sent = True
+            except _queue.Empty:
+                pass
+            await asyncio.sleep(0.005 if sent else 0.02)
+
+    conv = None
+    drain_task = asyncio.create_task(drain())
+    try:
+        conv = OmniRealtimeConversation(
+            model=config.OMNI_MODEL, callback=CB(), api_key=config.DASHSCOPE_API_KEY)
+        conv.connect()
+        conv.update_session(
+            output_modalities=[MultiModality.TEXT, MultiModality.AUDIO],
+            voice=config.OMNI_VOICE,
+            input_audio_format=AudioFormat.PCM_16000HZ_MONO_16BIT,
+            output_audio_format=AudioFormat.PCM_24000HZ_MONO_16BIT,
+            enable_input_audio_transcription=True,
+            enable_turn_detection=True,
+            turn_detection_type="server_vad",
+            instructions=OMNI_INSTRUCTIONS,
+        )
+        cost_tracker.new_request()
+        cost_tracker.log("full")   # 实时会话计一次（粗略，便于成本面板展示）
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            txt = msg.get("text")
+            if not txt:
+                continue
+            d = _json.loads(txt)
+            t = d.get("type")
+            if t == "audio":
+                conv.append_audio(d.get("data", ""))
+                state["audio_seen"] = True
+            elif t == "video":
+                if state.get("audio_seen"):   # Omni 要求先有音频再发图，否则报错
+                    conv.append_video(d.get("data", ""))
+            elif t == "cancel":
+                try: conv.cancel_response()
+                except Exception: pass
+            elif t == "close":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[ws_realtime error] {e}")
+    finally:
+        state["closed"] = True
+        drain_task.cancel()
+        if conv is not None:
+            try: conv.close()
+            except Exception: pass
 
 
 def _sse(obj: dict) -> str:
