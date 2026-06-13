@@ -53,6 +53,11 @@ let asrFeeding = false;     // 当前句是否已开始喂音频
 let speechRate = parseFloat(localStorage.getItem('speechRate') || '1') || 1;
 speechRate = Math.min(2.0, Math.max(0.6, speechRate));
 
+let lastAnswer = '';   // 上一次的 AI 回答，供「再说一遍」重播
+const HELP_TEXT = '你可以直接说出问题，比如这是什么、这是什么颜色、帮我读验证码。' +
+  '可以说导航模式、阅读模式、聊天模式来切换，说退出回到问答。' +
+  '还可以说再说一遍来重听，说说快点或说慢点来调节语速。';
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 850;      // 停顿多久算一句结束（越小越快触发）
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -370,6 +375,25 @@ function handleClientCommand(text) {
     speakPrompt('语速已恢复正常。', () => { ttsPlaying = false; });
     return true;
   }
+
+  // 再说一遍：重播上一次回答
+  if (/(再说一遍|再说一次|重复一遍|没听清|再读一遍|重听)/.test(t)) {
+    isProcessing = false;
+    if (lastAnswer) {
+      speakPrompt(lastAnswer, () => { ttsPlaying = false; });
+    } else {
+      ttsPlaying = false;
+      speakPrompt('还没有可以重复的内容，请先提问。', () => { ttsPlaying = false; });
+    }
+    return true;
+  }
+
+  // 帮助：语音列出功能
+  if (/(我能做什么|能做什么|有什么功能|怎么用|帮助|使用说明|功能介绍)/.test(t)) {
+    isProcessing = false;
+    speakPrompt(HELP_TEXT, () => { ttsPlaying = false; });
+    return true;
+  }
   return false;
 }
 
@@ -471,6 +495,7 @@ async function readPage() {
     answerBox.style.display = 'block';
     answerBox.innerHTML = '<div class="ans"></div>';
     answerBox.querySelector('.ans').textContent = text || '没有看到清晰的文字';
+    if (text) lastAnswer = text;   // 供「再说一遍」重听这一页
     // 端侧优先朗读（手机上云端语音常不出声/延迟），无本地语音再回退云端
     speakPrompt(text || '没有看到清晰的文字，请把摄像头对准文字内容。', () => {
       reading = false; isProcessing = false;
@@ -655,6 +680,7 @@ async function runChatTopic() {
       answerBox.style.display = 'block';
       answerBox.innerHTML = '<div class="ans"></div>';
       answerBox.querySelector('.ans').textContent = text;
+      lastAnswer = text;   // 供「再说一遍」
       // 端侧优先（低延迟），无本地语音再回退云端
       speakPrompt(text, () => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
     } else {
@@ -899,6 +925,7 @@ async function finalizeUtterance() {
 
   // 回答整段一次性播报：端侧优先（更快）。播完立即恢复收音，不再加额外提示，降低对话循环延迟。
   const toSpeak = fullAnswer.replace(/[*#`>\-]/g, '').trim() || '我没有看清，请再说一遍。';
+  if (!errored) lastAnswer = toSpeak;   // 供「再说一遍」
   buzz(60);   // 答案就绪：震动提示（非视觉确认）
   if (!errored) setStatus('正在回答…', '#9b59b6');
   speakPrompt(toSpeak, () => {
