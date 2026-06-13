@@ -49,6 +49,10 @@ let chatIdleTimer = null;   // 聊天空闲计时
 let asrWS = null;           // 持久 WebSocket
 let asrFeeding = false;     // 当前句是否已开始喂音频
 
+// 语速倍率（盲人常偏好快语速），范围 0.6~2.0，本地持久化
+let speechRate = parseFloat(localStorage.getItem('speechRate') || '1') || 1;
+speechRate = Math.min(2.0, Math.max(0.6, speechRate));
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 850;      // 停顿多久算一句结束（越小越快触发）
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -137,6 +141,7 @@ async function synthCosyVoice(text) {
 function playMp3(b64) {
   return new Promise((resolve) => {
     ttsPlayer.src = 'data:audio/mp3;base64,' + b64;
+    try { ttsPlayer.playbackRate = speechRate; } catch (e) {}   // 云端语音按倍率加速
     ttsPlayer.onended = resolve;
     ttsPlayer.onerror = resolve;
     ttsPlayer.play().catch(resolve);
@@ -147,7 +152,7 @@ function speakLocal(text) {
   return new Promise((resolve) => {
     if (!window.speechSynthesis) { resolve(); return; }
     const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'zh-CN'; u.rate = 1.05;
+    u.lang = 'zh-CN'; u.rate = Math.min(2, 1.05 * speechRate);
     if (zhVoice) u.voice = zhVoice;
     u.onend = resolve; u.onerror = resolve;
     speechSynthesis.speak(u);
@@ -177,7 +182,7 @@ function speakPrompt(text, onend) {
   let released = false;
   const release = () => { if (released) return; released = true; ttsPlaying = false; if (onend) onend(); };
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'zh-CN'; u.rate = 1.08;
+  u.lang = 'zh-CN'; u.rate = Math.min(2, 1.08 * speechRate);
   if (zhVoice) u.voice = zhVoice;
   u.onend = release; u.onerror = release;
   try { speechSynthesis.speak(u); } catch (e) { release(); return; }
@@ -335,6 +340,37 @@ async function switchCamera() {
     speakPrompt('这个镜头切换失败了，请再点一次试试其他镜头');
   }
   switching = false;
+}
+
+// ===== 客户端语音指令（语速等，本地处理不走云端）=====
+// 返回 true 表示已作为指令处理，调用方不再发给 AI。
+function handleClientCommand(text) {
+  if (!text) return false;
+  const t = text.replace(/[，。！？、\s]/g, '');
+
+  // 语速调节
+  if (/(说快点|快一点|语速快|快点说|加快语速|再快点)/.test(t)) {
+    speechRate = Math.min(2.0, speechRate + 0.25);
+    localStorage.setItem('speechRate', String(speechRate));
+    isProcessing = false; ttsPlaying = false;
+    speakPrompt('好的，说快一点。', () => { ttsPlaying = false; });
+    return true;
+  }
+  if (/(说慢点|慢一点|语速慢|慢点说|放慢语速|再慢点)/.test(t)) {
+    speechRate = Math.max(0.6, speechRate - 0.25);
+    localStorage.setItem('speechRate', String(speechRate));
+    isProcessing = false; ttsPlaying = false;
+    speakPrompt('好的，说慢一点。', () => { ttsPlaying = false; });
+    return true;
+  }
+  if (/(正常语速|语速正常|恢复语速|语速复位)/.test(t)) {
+    speechRate = 1.0;
+    localStorage.setItem('speechRate', String(speechRate));
+    isProcessing = false; ttsPlaying = false;
+    speakPrompt('语速已恢复正常。', () => { ttsPlaying = false; });
+    return true;
+  }
+  return false;
 }
 
 // ===== 模式状态机 =====
@@ -790,6 +826,9 @@ async function finalizeUtterance() {
     for (const c of chunks) { merged.set(c, off); off += c.length; }
     wavB64 = arrayBufferToBase64(encodeWav16k(merged, micSampleRate));
   }
+
+  // 客户端语音指令（语速等）：命中则本地处理，不发给 AI
+  if (userText && handleClientCommand(userText)) return;
 
   answerBox.style.display = 'block';
   answerBox.innerHTML = '<div class="heard">🗣️ …</div><div class="ans"></div>';
