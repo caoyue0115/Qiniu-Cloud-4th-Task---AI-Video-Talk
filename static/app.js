@@ -46,7 +46,7 @@ let modeLoopTimer = null;   // 模式周期循环
 let chatIdleTimer = null;   // 聊天空闲计时
 
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
-const SILENCE_HANG_MS = 1300;     // 停顿多久算一句结束
+const SILENCE_HANG_MS = 850;      // 停顿多久算一句结束（越小越快触发）
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
 const FRAME_INTERVAL_MS = 700;    // 抓帧间隔
 const MAX_FRAMES = 3;             // 最多保留帧数
@@ -717,11 +717,9 @@ async function finalizeUtterance() {
   let errored = false;
   let modeSwitch = null;   // 收到模式切换指令
 
-  // 当前模式参与请求（后端据此识别指令上下文）
-  // 抓「此刻」的画面作为主画面，保证所见即所问（避免用到旧帧导致答非所见）
+  // 只发「此刻」这一帧：手机上传 4 帧很慢，单帧足够且所见即所问，大幅降低延迟
   const freshFrame = captureFrameNow();
-  const framesToSend = recentFrames.slice();
-  if (freshFrame) framesToSend.push(freshFrame);   // 放最后 = 服务端取的 latest
+  const framesToSend = freshFrame ? [freshFrame] : recentFrames.slice(-1);
 
   try {
     const resp = await fetch('/api/talk_stream', {
@@ -777,14 +775,12 @@ async function finalizeUtterance() {
     return;
   }
 
-  // 回答整段一次性播报：端侧优先（更快），无本地语音时自动回退云端。
-  // 播完后提示「可继续提问」，再恢复收音。
+  // 回答整段一次性播报：端侧优先（更快）。播完立即恢复收音，不再加额外提示，降低对话循环延迟。
   const toSpeak = fullAnswer.replace(/[*#`>\-]/g, '').trim() || '我没有看清，请再说一遍。';
   if (!errored) setStatus('正在回答…', '#9b59b6');
   speakPrompt(toSpeak, () => {
-    isProcessing = false;
+    isProcessing = false; ttsPlaying = false;
     setStatus('正在聆听…请继续提问', '#2ecc71');
-    speakPrompt('您可以继续提问', () => { ttsPlaying = false; });
   });
 }
 

@@ -287,9 +287,9 @@ def scene(payload: dict = Body(...)):
     if not frames:
         return JSONResponse({"text": "", "cost": cost_tracker.get_report()})
 
-    # 阅读要读全文用大模型更准；导航/聊天用小模型更快更省
+    # 全部用小模型(qwen-vl-plus)：延迟更低更省；OCR/聊天/导航精度足够
     if mode == "read":
-        model, mx = "full", 400
+        model, mx = "mini", 400
     elif mode == "chat":
         model, mx = "mini", 120
     else:  # nav
