@@ -338,6 +338,7 @@ function setModeIndicator() {
 function stopModeLoops() {
   if (modeLoopTimer) { clearInterval(modeLoopTimer); modeLoopTimer = null; }
   if (chatIdleTimer) { clearTimeout(chatIdleTimer); chatIdleTimer = null; }
+  reading = false;
 }
 
 function enterMode(mode) {
@@ -352,8 +353,88 @@ function enterMode(mode) {
     speakPrompt('已进入聊天模式，我们随便聊聊。', () => { ttsPlaying = false; scheduleChat(2000); });
   } else if (mode === 'read') {
     speakPrompt('已进入阅读模式，请把摄像头对准文字。');   // PR-B 接入循环
+  } else if (mode === 'read') {
+    speakPrompt('已进入阅读模式，请把摄像头对准文字，我会自动朗读。',
+                () => { ttsPlaying = false; startReading(); });
   } else if (mode === 'nav') {
     speakPrompt('已进入导航模式，我会提醒前方的危险。');   // PR-C 接入循环
+  }
+}
+
+// ===== 阅读模式：自动朗读 + 翻页检测 =====
+const _sigCanvas = document.createElement('canvas');
+const _sigCtx = _sigCanvas.getContext('2d');
+let readLastSig = null;     // 上次朗读那一帧的指纹
+let readPrevSig = null;     // 上一 tick 的指纹（判稳定）
+let reading = false;        // 正在朗读
+
+// 取当前画面的低分辨率灰度指纹（用于翻页检测）
+function videoSignature() {
+  if (!video.videoWidth) return null;
+  const S = 32;
+  _sigCanvas.width = S; _sigCanvas.height = S;
+  _sigCtx.drawImage(video, 0, 0, S, S);
+  const d = _sigCtx.getImageData(0, 0, S, S).data;
+  const g = new Float32Array(S * S);
+  for (let i = 0; i < S * S; i++) {
+    g[i] = (d[i * 4] + d[i * 4 + 1] + d[i * 4 + 2]) / 3;
+  }
+  return g;
+}
+
+function sigDiff(a, b) {
+  if (!a || !b) return 1;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += Math.abs(a[i] - b[i]);
+  return s / a.length / 255;   // 0~1
+}
+
+function startReading() {
+  readLastSig = null; readPrevSig = null;
+  // 立即读一次，然后周期检测翻页
+  readPage();
+  modeLoopTimer = setInterval(() => {
+    if (currentMode !== 'read' || reading || isProcessing) return;
+    const sig = videoSignature();
+    if (!sig) return;
+    const changedVsRead = sigDiff(sig, readLastSig);   // 和已读那页比
+    const stableNow = sigDiff(sig, readPrevSig) < 0.04; // 当前画面稳定（翻完了）
+    readPrevSig = sig;
+    // 画面相对已读页大幅变化 且 已稳定 → 翻页了，重新朗读
+    if (changedVsRead > 0.14 && stableNow) {
+      speakPrompt('检测到翻页，正在朗读', () => { ttsPlaying = false; readPage(); });
+    }
+  }, 1200);
+}
+
+async function readPage() {
+  if (currentMode !== 'read' || reading) return;
+  const frame = captureFrameNow();
+  if (!frame) return;
+  reading = true; isProcessing = true; ttsPlaying = true;
+  readLastSig = videoSignature();   // 记录这一页指纹
+  setStatus('正在朗读…', '#9b59b6');
+  try {
+    const resp = await fetch('/api/scene', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'read', frames: [frame] })
+    });
+    const data = await resp.json();
+    if (data.cost) costPanel.textContent = data.cost;
+    const text = (data.text || '').trim();
+    answerBox.style.display = 'block';
+    answerBox.innerHTML = '<div class="ans"></div>';
+    answerBox.querySelector('.ans').textContent = text || '没有看到清晰的文字';
+    // 阅读用云端 CosyVoice（长文更清晰自然）
+    speak(text || '没有看到清晰的文字，请把摄像头对准文字内容。', { interrupt: true });
+    waitSpeechDone(() => {
+      reading = false; isProcessing = false; ttsPlaying = false;
+      if (currentMode === 'read' && text) {
+        speakPrompt('这一页读完了，翻页后我会继续。', () => { ttsPlaying = false; });
+      }
+    });
+  } catch (e) {
+    reading = false; isProcessing = false; ttsPlaying = false;
   }
 }
 
