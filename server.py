@@ -279,6 +279,24 @@ def tts(payload: dict = Body(...)):
     return JSONResponse({"audio_mp3_b64": base64.b64encode(audio_bytes).decode()})
 
 
+@app.post("/api/asr")
+def asr(payload: dict = Body(...)):
+    """一次性语音识别：接收 16k 单声道 WAV(base64)，返回识别文字。
+
+    稳定可靠（不依赖长连接），供前端拿到文字后做模式分流。
+    """
+    audio_b64 = payload.get("audio_wav_b64", "")
+    if not audio_b64:
+        return JSONResponse({"text": ""})
+    try:
+        text = speech.transcribe_wav_bytes(base64.b64decode(audio_b64))
+        cost_tracker.log("asr")
+        return JSONResponse({"text": text or ""})
+    except Exception as e:
+        print(f"[api asr error] {e}")
+        return JSONResponse({"text": ""})
+
+
 @app.post("/api/scene")
 def scene(payload: dict = Body(...)):
     """模式场景理解：按 mode 用不同 prompt 描述画面。
