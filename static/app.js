@@ -1105,7 +1105,7 @@ function hangup() {
 let rtActive = false, rtWS = null, rtMicCtx = null, rtMicNode = null;
 let rtPlayCtx = null, rtPlayHead = 0, rtSources = [], rtFrameTimer = null;
 let rtCostTimer = null, rtStartMs = 0;
-const RT_RATE_PER_MIN = 0.4;   // 实时模式按通话时长计费（预估，元/分钟，以实际计费为准）
+const RT_RATE_PER_MIN = 0.1;   // flash-realtime 按token估算约¥0.1/分钟（输入音频+图片+输出音频）；前90天有100万token免费额度
 const rtCanvas = document.createElement('canvas'), rtCtx2d = rtCanvas.getContext('2d');
 
 // 实时模式按通话时长更新成本面板（让仪表盘可读，区别于稳定模式的按次成本）
@@ -1118,9 +1118,9 @@ function rtUpdateCost() {
     '📊 成本统计（实时模式）\n────────────────────────────\n' +
     '实时对话 ×1 ¥' + cost + '\n' +
     '────────────────────────────\n' +
-    '计费方式：按通话时长（约¥' + RT_RATE_PER_MIN + '/分钟）\n' +
+    '计费方式：按token(音频+图片)，约¥' + RT_RATE_PER_MIN + '/分钟\n' +
     '已通话：' + mm + ':' + ss + '\n' +
-    '累计成本：¥' + cost;
+    '累计成本：¥' + cost + '（前90天100万token免费）';
 }
 function perfNow() { return (performance && performance.now) ? performance.now() : 0; }
 
