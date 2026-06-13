@@ -1,0 +1,9 @@
+# 模型权重与库文件按二进制处理，禁止换行符转换（防止 clone 后模型损坏）
+static/models/** binary
+static/models/coco-ssd/group1-shard* binary
+static/vendor/tf.min.js binary
+*.bin binary
+*.pt binary
+*.onnx binary
+*.wav binary
+*.mp3 binary
