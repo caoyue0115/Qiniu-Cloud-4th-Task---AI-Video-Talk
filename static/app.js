@@ -1215,7 +1215,9 @@ function rtHandle(msg) {
   } else if (msg.type === 'done') {
     setStatus('实时通话中 · 请继续说', '#2ecc71');
   } else if (msg.type === 'error') {
-    setStatus('实时识别出错，请重试', '#e74c3c');
+    // 实时模式失败（如 key 未开通 Omni-Realtime）：明确提示改用稳定模式
+    setStatus('实时模式不可用，请挂断后用「接通」稳定模式', '#e74c3c');
+    speakPrompt('实时模式暂时不可用，请挂断后点接通，使用稳定模式。');
   }
 }
 
