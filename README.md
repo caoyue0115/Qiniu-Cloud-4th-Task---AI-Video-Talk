@@ -81,6 +81,13 @@ python server.py
 #    本地访问 http://127.0.0.1:8000
 ```
 
+### 🔑 关于 API Key（重要）
+
+- **用上方在线体验链接的评委：无需任何 Key**，链接已用作者的 key 跑在服务器上，开箱即用。
+- **自己 clone 本地运行**：需在 `.env` 填入自己的 `DASHSCOPE_API_KEY`（[阿里云百炼](https://bailian.console.aliyun.com/) 注册，有免费额度）。
+  - **稳定模式**：普通 key + 免费额度即可（用到 千问 VL / Paraformer / CosyVoice）。
+  - **实时模式**：需 key 额外**开通 [Qwen-Omni-Realtime](https://help.aliyun.com/zh/model-studio/realtime)**（仅北京/新加坡区）。未开通时实时模式不可用，**稳定模式不受影响、照常使用**。
+
 ### 让手机/他人访问（cloudflared 隧道）
 
 ```bash
