@@ -339,6 +339,7 @@ function stopModeLoops() {
   if (modeLoopTimer) { clearInterval(modeLoopTimer); modeLoopTimer = null; }
   if (chatIdleTimer) { clearTimeout(chatIdleTimer); chatIdleTimer = null; }
   reading = false;
+  navRunning = false;
 }
 
 function enterMode(mode) {
@@ -352,12 +353,11 @@ function enterMode(mode) {
   } else if (mode === 'chat') {
     speakPrompt('已进入聊天模式，我们随便聊聊。', () => { ttsPlaying = false; scheduleChat(2000); });
   } else if (mode === 'read') {
-    speakPrompt('已进入阅读模式，请把摄像头对准文字。');   // PR-B 接入循环
-  } else if (mode === 'read') {
     speakPrompt('已进入阅读模式，请把摄像头对准文字，我会自动朗读。',
                 () => { ttsPlaying = false; startReading(); });
   } else if (mode === 'nav') {
-    speakPrompt('已进入导航模式，我会提醒前方的危险。');   // PR-C 接入循环
+    speakPrompt('已进入导航模式，正在准备，我会提醒前方的人、车和危险。',
+                () => { ttsPlaying = false; startNavigation(); });
   }
 }
 
@@ -425,17 +425,157 @@ async function readPage() {
     answerBox.style.display = 'block';
     answerBox.innerHTML = '<div class="ans"></div>';
     answerBox.querySelector('.ans').textContent = text || '没有看到清晰的文字';
-    // 阅读用云端 CosyVoice（长文更清晰自然）
-    speak(text || '没有看到清晰的文字，请把摄像头对准文字内容。', { interrupt: true });
-    waitSpeechDone(() => {
-      reading = false; isProcessing = false; ttsPlaying = false;
+    // 端侧优先朗读（手机上云端语音常不出声/延迟），无本地语音再回退云端
+    speakPrompt(text || '没有看到清晰的文字，请把摄像头对准文字内容。', () => {
+      reading = false; isProcessing = false;
       if (currentMode === 'read' && text) {
         speakPrompt('这一页读完了，翻页后我会继续。', () => { ttsPlaying = false; });
+      } else {
+        ttsPlaying = false;
       }
     });
   } catch (e) {
     reading = false; isProcessing = false; ttsPlaying = false;
   }
+}
+
+// ===== 导航模式：端侧 TF.js 实时检测 + 千问周期补充 =====
+// 实时检测/告警逻辑参考开源项目 OpenAIglasses_for_Navigation 的
+// 「方位分区 + 去重播报」思路（MIT, AI-FanGe，详见 CREDITS.md），为 Web 重新实现。
+
+let cocoModel = null;
+let cocoLoading = null;
+let navRunning = false;
+let navDetecting = false;
+const navLastAlert = {};   // key=类别+方位 -> 时间戳，用于去重
+let navQwenLast = '';
+
+// COCO 类别 → 中文 + 是否危险目标
+const NAV_CLASSES = {
+  person: '行人', car: '汽车', bus: '公交车', truck: '卡车',
+  motorcycle: '摩托车', bicycle: '自行车', 'traffic light': '红绿灯',
+  'stop sign': '停车标志', 'fire hydrant': '消防栓', bench: '长椅',
+};
+
+// 懒加载 TF.js + COCO-SSD（CDN，仅进入导航模式时下载）
+function loadCocoSsd() {
+  if (cocoModel) return Promise.resolve(cocoModel);
+  if (cocoLoading) return cocoLoading;
+  cocoLoading = new Promise(async (resolve, reject) => {
+    try {
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
+      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
+      cocoModel = await window.cocoSsd.load({ base: 'lite_mobilenet_v2' });
+      resolve(cocoModel);
+    } catch (e) { reject(e); }
+  });
+  return cocoLoading;
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+function zoneOf(centerXRatio) {
+  if (centerXRatio < 0.34) return '左前方';
+  if (centerXRatio > 0.66) return '右前方';
+  return '正前方';
+}
+
+async function startNavigation() {
+  navRunning = true;
+  navQwenLast = '';
+  for (const k in navLastAlert) delete navLastAlert[k];
+  // 加载端侧模型
+  try {
+    await loadCocoSsd();
+    if (currentMode !== 'nav') return;
+    speakPrompt('导航已就绪。');
+  } catch (e) {
+    console.warn('COCO-SSD 加载失败，仅用云端导航', e);
+    speakPrompt('实时检测加载失败，将用云端导航提示。');
+  }
+  // 实时检测循环
+  navDetectLoop();
+  // 千问周期补充（楼梯/指示牌/路况，COCO 检测不到的）
+  modeLoopTimer = setInterval(navQwenTick, 5000);
+}
+
+async function navDetectLoop() {
+  if (!navRunning || currentMode !== 'nav') return;
+  if (cocoModel && !navDetecting && video.videoWidth && !ttsPlaying && !isProcessing) {
+    navDetecting = true;
+    try {
+      const preds = await cocoModel.detect(video, 8);
+      handleDetections(preds);
+    } catch (e) {}
+    navDetecting = false;
+  }
+  if (navRunning) setTimeout(navDetectLoop, 450);
+}
+
+function handleDetections(preds) {
+  if (!preds || !preds.length) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const frameArea = vw * vh;
+  // 选出危险目标里「最近/最大」的一个播报，避免一次说太多
+  let best = null;
+  for (const p of preds) {
+    const cn = NAV_CLASSES[p.class];
+    if (!cn || p.score < 0.55) continue;
+    const [x, y, w, h] = p.bbox;
+    const areaRatio = (w * h) / frameArea;
+    if (areaRatio < 0.04) continue;   // 太小/太远，忽略
+    const cx = (x + w / 2) / vw;
+    const score = areaRatio + (Math.abs(cx - 0.5) < 0.2 ? 0.1 : 0); // 越大越居中越优先
+    if (!best || score > best.score2) {
+      best = { cn, zone: zoneOf(cx), areaRatio, score2: score };
+    }
+  }
+  if (!best) return;
+  const key = best.cn + best.zone;
+  const now = nowMs();
+  if (navLastAlert[key] && now - navLastAlert[key] < 4000) return;  // 4秒内不重复
+  navLastAlert[key] = now;
+  const near = best.areaRatio > 0.22 ? '很近，' : '';
+  speakPrompt(`${best.zone}${near}有${best.cn}`);
+}
+
+// 单调时钟（避免依赖 Date）
+let _navT0 = null;
+function nowMs() {
+  if (performance && performance.now) return performance.now();
+  if (_navT0 == null) _navT0 = 0;
+  return (_navT0 += 450);
+}
+
+async function navQwenTick() {
+  if (currentMode !== 'nav' || isProcessing || ttsPlaying) return;
+  const frame = captureFrameNow();
+  if (!frame) return;
+  isProcessing = true;
+  try {
+    const resp = await fetch('/api/scene', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'nav', frames: [frame] })
+    });
+    const data = await resp.json();
+    if (data.cost) costPanel.textContent = data.cost;
+    const text = (data.text || '').trim();
+    isProcessing = false;
+    // 过滤"前方安全"和与上次重复的，避免唠叨
+    if (text && !/前方安全|安全|没有/.test(text) && text !== navQwenLast && currentMode === 'nav') {
+      navQwenLast = text;
+      answerBox.style.display = 'block';
+      answerBox.innerHTML = '<div class="ans"></div>';
+      answerBox.querySelector('.ans').textContent = text;
+      speakPrompt(text);
+    }
+  } catch (e) { isProcessing = false; }
 }
 
 // ===== 聊天模式：AI 主动找话题 =====
@@ -461,8 +601,8 @@ async function runChatTopic() {
       answerBox.style.display = 'block';
       answerBox.innerHTML = '<div class="ans"></div>';
       answerBox.querySelector('.ans').textContent = text;
-      speak(text, { interrupt: true });   // 聊天用云端 CosyVoice，更自然
-      waitSpeechDone(() => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
+      // 端侧优先（低延迟），无本地语音再回退云端
+      speakPrompt(text, () => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
     } else {
       ttsPlaying = false; isProcessing = false; scheduleChat(6000);
     }
