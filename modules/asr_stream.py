@@ -1,21 +1,33 @@
 """流式语音识别：阿里云 Paraformer 实时识别。
 
-边收音边识别，说完后约 0.2 秒即可拿到文字（相比一次性识别省约 1 秒）。
+边收音边识别，说完后短暂等待最终修正结果即可拿到文字（比一次性识别快）。
+准确度优化：累积「已结束的句子」（Paraformer 对结束句会给出修正后的准确文本），
+而非直接用逐字滚动的中间结果；finish 时再短暂等待最终结果到达。
 供 WebSocket 端点逐帧喂入 16k 单声道 PCM(int16) 音频。
 """
+import time
 import threading
 import dashscope
-from dashscope.audio.asr import Recognition, RecognitionCallback
+from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 
 from utils import config
 
 dashscope.api_key = config.DASHSCOPE_API_KEY
 
 
+def _sentence_ended(sentence) -> bool:
+    try:
+        return bool(RecognitionResult.is_sentence_end(sentence))
+    except Exception:
+        return bool(isinstance(sentence, dict) and sentence.get("sentence_end"))
+
+
 class _Collector(RecognitionCallback):
     def __init__(self):
         self.lock = threading.Lock()
-        self.text = ""
+        self.sentences = []   # 已结束的句子（修正后，准确）
+        self.partial = ""     # 当前未结束句子的滚动文本
+        self.got_final = False
 
     def on_event(self, result):
         try:
@@ -27,11 +39,22 @@ class _Collector(RecognitionCallback):
         if isinstance(s, dict):
             s = [s]
         with self.lock:
-            # 实时识别回调里 sentence 是逐步完善的当前句；取最新文本
-            parts = [x.get("text", "") for x in s if isinstance(x, dict)]
-            joined = "".join(parts).strip()
-            if joined:
-                self.text = joined
+            for x in s:
+                if not isinstance(x, dict):
+                    continue
+                txt = (x.get("text") or "").strip()
+                if not txt:
+                    continue
+                if _sentence_ended(x):
+                    self.sentences.append(txt)
+                    self.partial = ""
+                    self.got_final = True
+                else:
+                    self.partial = txt
+
+    def best_text(self) -> str:
+        with self.lock:
+            return ("".join(self.sentences) + self.partial).strip()
 
 
 class StreamingASR:
@@ -58,13 +81,24 @@ class StreamingASR:
             except Exception as e:
                 print(f"[asr feed error] {e}")
 
-    def finish(self) -> str:
-        """停止并返回最终文本。"""
+    def finish(self, max_wait: float = 0.6) -> str:
+        """停止并返回最终文本。
+
+        stop 后短暂等待最终修正结果到达（最多 max_wait 秒），提升准确度。
+        """
         if self._started:
             try:
                 self._rec.stop()
             except Exception as e:
                 print(f"[asr stop error] {e}")
             self._started = False
-        with self._cb.lock:
-            return self._cb.text
+        # 轮询等待句末修正结果；通常很快到达，没有则用现有最优文本
+        deadline = max_wait
+        waited = 0.0
+        while waited < deadline:
+            with self._cb.lock:
+                if self._cb.got_final:
+                    break
+            time.sleep(0.05)
+            waited += 0.05
+        return self._cb.best_text()
