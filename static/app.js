@@ -425,12 +425,13 @@ async function readPage() {
     answerBox.style.display = 'block';
     answerBox.innerHTML = '<div class="ans"></div>';
     answerBox.querySelector('.ans').textContent = text || '没有看到清晰的文字';
-    // 阅读用云端 CosyVoice（长文更清晰自然）
-    speak(text || '没有看到清晰的文字，请把摄像头对准文字内容。', { interrupt: true });
-    waitSpeechDone(() => {
-      reading = false; isProcessing = false; ttsPlaying = false;
+    // 端侧优先朗读（手机上云端语音常不出声/延迟），无本地语音再回退云端
+    speakPrompt(text || '没有看到清晰的文字，请把摄像头对准文字内容。', () => {
+      reading = false; isProcessing = false;
       if (currentMode === 'read' && text) {
         speakPrompt('这一页读完了，翻页后我会继续。', () => { ttsPlaying = false; });
+      } else {
+        ttsPlaying = false;
       }
     });
   } catch (e) {
@@ -600,8 +601,8 @@ async function runChatTopic() {
       answerBox.style.display = 'block';
       answerBox.innerHTML = '<div class="ans"></div>';
       answerBox.querySelector('.ans').textContent = text;
-      speak(text, { interrupt: true });   // 聊天用云端 CosyVoice，更自然
-      waitSpeechDone(() => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
+      // 端侧优先（低延迟），无本地语音再回退云端
+      speakPrompt(text, () => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
     } else {
       ttsPlaying = false; isProcessing = false; scheduleChat(6000);
     }
