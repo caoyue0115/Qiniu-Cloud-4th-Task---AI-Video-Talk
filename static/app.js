@@ -44,6 +44,7 @@ let switching = false;      // 切换中
 let currentMode = 'qa';
 let modeLoopTimer = null;   // 模式周期循环
 let chatIdleTimer = null;   // 聊天空闲计时
+let bgBusy = false;         // 后台图像识别(导航/聊天)在途——不屏蔽麦克风，与语音识别并行
 
 // 流式 ASR：边说边识别，省掉服务端一次性识别的~1秒
 let asrWS = null;           // 持久 WebSocket
@@ -430,6 +431,7 @@ function stopModeLoops() {
   reading = false;
   navRunning = false;
   aiSpeaking = false; bargeMs = 0;
+  bgBusy = false;
 }
 
 function enterMode(mode) {
@@ -655,10 +657,11 @@ function nowMs() {
 }
 
 async function navQwenTick() {
-  if (currentMode !== 'nav' || isProcessing || ttsPlaying) return;
+  // 用 bgBusy 而非 isProcessing：后台识别不屏蔽麦克风，用户随时能说话/退出
+  if (currentMode !== 'nav' || bgBusy || isProcessing || recording || ttsPlaying) return;
   const frame = captureFrameNow();
   if (!frame) return;
-  isProcessing = true;
+  bgBusy = true;
   try {
     const resp = await fetch('/api/scene', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -667,16 +670,17 @@ async function navQwenTick() {
     const data = await resp.json();
     if (data.cost) costPanel.textContent = data.cost;
     const text = (data.text || '').trim();
-    isProcessing = false;
-    // 过滤"前方安全"和与上次重复的，避免唠叨
-    if (text && !/前方安全|安全|没有/.test(text) && text !== navQwenLast && currentMode === 'nav') {
+    bgBusy = false;
+    // 用户此刻在说话/提问/播报中，就不抢话；并过滤"前方安全"和重复
+    const busy = isProcessing || recording || ttsPlaying || aiSpeaking;
+    if (text && !busy && !/前方安全|安全|没有/.test(text) && text !== navQwenLast && currentMode === 'nav') {
       navQwenLast = text;
       answerBox.style.display = 'block';
       answerBox.innerHTML = '<div class="ans"></div>';
       answerBox.querySelector('.ans').textContent = text;
       speakPrompt(text);
     }
-  } catch (e) { isProcessing = false; }
+  } catch (e) { bgBusy = false; }
 }
 
 // ===== 聊天模式：AI 主动找话题 =====
@@ -686,10 +690,11 @@ function scheduleChat(delay) {
 }
 
 async function runChatTopic() {
-  if (currentMode !== 'chat' || isProcessing) { scheduleChat(4000); return; }
+  // 用 bgBusy：后台找话题不屏蔽麦克风，用户随时能说话/退出/打断
+  if (currentMode !== 'chat' || bgBusy || isProcessing || recording || ttsPlaying) { scheduleChat(4000); return; }
   const frame = captureFrameNow();
   if (!frame) { scheduleChat(3000); return; }
-  isProcessing = true; ttsPlaying = true;
+  bgBusy = true;
   try {
     const resp = await fetch('/api/scene', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -698,19 +703,21 @@ async function runChatTopic() {
     const data = await resp.json();
     if (data.cost) costPanel.textContent = data.cost;
     const text = (data.text || '').trim();
-    if (text && currentMode === 'chat') {
+    bgBusy = false;
+    // 用户此刻在说话/提问/播报中，跳过这次主动话题
+    const busy = isProcessing || recording || ttsPlaying || aiSpeaking;
+    if (text && currentMode === 'chat' && !busy) {
       answerBox.style.display = 'block';
       answerBox.innerHTML = '<div class="ans"></div>';
       answerBox.querySelector('.ans').textContent = text;
       lastAnswer = text;   // 供「再说一遍」
-      // 端侧优先（低延迟），无本地语音再回退云端
-      aiSpeaking = true;   // 聊天播报可被打断
-      speakPrompt(text, () => { aiSpeaking = false; ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
+      aiSpeaking = true; ttsPlaying = true;   // 聊天播报可被打断
+      speakPrompt(text, () => { aiSpeaking = false; ttsPlaying = false; scheduleChat(9000); });
     } else {
-      ttsPlaying = false; isProcessing = false; scheduleChat(6000);
+      scheduleChat(6000);
     }
   } catch (e) {
-    ttsPlaying = false; isProcessing = false; scheduleChat(8000);
+    bgBusy = false; scheduleChat(8000);
   }
 }
 
