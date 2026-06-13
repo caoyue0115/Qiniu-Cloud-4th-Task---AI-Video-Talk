@@ -78,7 +78,15 @@ def _fingerprint(image) -> str:
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def showcase():
+    """展示页（评委入口）：产品介绍 + 手机样机嵌入真实 app + 实时仪表盘。"""
+    with open("static/showcase.html", encoding="utf-8") as f:
+        return f.read()
+
+
+@app.get("/app", response_class=HTMLResponse)
+def app_page():
+    """真实通话 app（嵌入展示页的手机样机 iframe 中运行）。"""
     with open("static/index.html", encoding="utf-8") as f:
         return f.read()
 
