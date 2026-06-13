@@ -5,3 +5,4 @@ opencv-python>=4.9.0
 pillow>=10.0.0
 python-dotenv>=1.0.0
 soundfile>=0.12.1
+websockets

@@ -45,6 +45,10 @@ let currentMode = 'qa';
 let modeLoopTimer = null;   // 模式周期循环
 let chatIdleTimer = null;   // 聊天空闲计时
 
+// 流式 ASR：边说边识别，省掉服务端一次性识别的~1秒
+let asrWS = null;           // 持久 WebSocket
+let asrFeeding = false;     // 当前句是否已开始喂音频
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 850;      // 停顿多久算一句结束（越小越快触发）
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -254,6 +258,7 @@ async function startCall() {
 
   startFrameCapture();
   startVAD();
+  asrConnect();   // 开启流式识别通道
   currentMode = 'qa'; setModeIndicator();
   setStatus('正在聆听…请说出你的问题', '#2ecc71');
   // 「正在聆听」提示走浏览器本地语音（即时，不受云端延迟影响）
@@ -652,6 +657,62 @@ function startFrameCapture() {
 }
 
 // ===== VAD：Web Audio 实时音量检测 =====
+// ===== 流式 ASR 客户端 =====
+function asrConnect() {
+  try {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    asrWS = new WebSocket(`${proto}://${location.host}/ws/asr`);
+    asrWS.binaryType = 'arraybuffer';
+    asrWS.onclose = () => { asrWS = null; };
+    asrWS.onerror = () => {};
+  } catch (e) { asrWS = null; }
+}
+
+function asrReady() {
+  return asrWS && asrWS.readyState === WebSocket.OPEN;
+}
+
+// 把一帧 Float32 音频重采样为 16k int16 PCM 并通过 WS 发送
+function asrFeed(float32, inRate) {
+  if (!asrReady()) return;
+  let data = float32;
+  if (inRate !== 16000) {
+    const ratio = inRate / 16000;
+    const newLen = Math.round(float32.length / ratio);
+    const out = new Float32Array(newLen);
+    for (let i = 0; i < newLen; i++) {
+      const idx = i * ratio, lo = Math.floor(idx), hi = Math.min(lo + 1, float32.length - 1);
+      out[i] = float32[lo] + (float32[hi] - float32[lo]) * (idx - lo);
+    }
+    data = out;
+  }
+  const buf = new ArrayBuffer(data.length * 2);
+  const view = new DataView(buf);
+  for (let i = 0; i < data.length; i++) {
+    let s = Math.max(-1, Math.min(1, data[i]));
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+  }
+  try { asrWS.send(buf); } catch (e) {}
+}
+
+// 结束当前句，返回识别文字（失败/超时返回空，由调用方回退）
+function asrFinishText() {
+  return new Promise((resolve) => {
+    asrFeeding = false;
+    if (!asrReady()) { resolve(''); return; }
+    let done = false;
+    const onMsg = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        if (d.type === 'final') { done = true; asrWS.removeEventListener('message', onMsg); resolve((d.text || '').trim()); }
+      } catch (e) {}
+    };
+    asrWS.addEventListener('message', onMsg);
+    try { asrWS.send('end'); } catch (e) { asrWS.removeEventListener('message', onMsg); resolve(''); return; }
+    setTimeout(() => { if (!done) { asrWS.removeEventListener('message', onMsg); resolve(''); } }, 2000);
+  });
+}
+
 function startVAD() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   micSampleRate = audioCtx.sampleRate;
@@ -672,13 +733,17 @@ function startVAD() {
 
     if (rms > SILENCE_THRESHOLD) {
       // 有声音
-      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; setStatus('正在聆听…', '#f1c40f'); }
-      pcmBuffer.push(new Float32Array(input));
+      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; asrFeeding = asrReady(); setStatus('正在聆听…', '#f1c40f'); }
+      const frame = new Float32Array(input);
+      pcmBuffer.push(frame);
+      if (asrFeeding) asrFeed(input, micSampleRate);   // 边说边流式识别
       speechMs += frameMs;
       silenceMs = 0;
     } else if (recording) {
-      // 说话后的静音
-      pcmBuffer.push(new Float32Array(input));
+      // 说话后的静音（也喂给 ASR，帮助断句）
+      const frame = new Float32Array(input);
+      pcmBuffer.push(frame);
+      if (asrFeeding) asrFeed(input, micSampleRate);
       silenceMs += frameMs;
       if (silenceMs >= SILENCE_HANG_MS) {
         // 一句话结束
@@ -696,24 +761,29 @@ function startVAD() {
   processor.connect(audioCtx.destination);
 }
 
-// ===== 一句话结束：封装 WAV 并流式发送 =====
+// ===== 一句话结束：优先用流式识别结果，回退 WAV =====
 async function finalizeUtterance() {
   const chunks = pcmBuffer;
   pcmBuffer = [];
   if (!chunks.length) return;
 
-  let total = 0;
-  for (const c of chunks) total += c.length;
-  const merged = new Float32Array(total);
-  let off = 0;
-  for (const c of chunks) { merged.set(c, off); off += c.length; }
-
-  const wav16k = encodeWav16k(merged, micSampleRate);
-  const b64 = arrayBufferToBase64(wav16k);
-
   isProcessing = true;
   ttsPlaying = true;   // 占用收音，避免边问边触发
   setStatus('正在看 · 正在思考…', '#3498db');
+
+  // 先拿流式识别文字（说完即得，省~1秒）；为空则回退到 WAV 上传识别
+  const streamedText = await asrFinishText();
+  let userText = streamedText;
+  let wavB64 = '';
+  if (!userText) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    wavB64 = arrayBufferToBase64(encodeWav16k(merged, micSampleRate));
+  }
+
   answerBox.style.display = 'block';
   answerBox.innerHTML = '<div class="heard">🗣️ …</div><div class="ans"></div>';
   const ansEl = answerBox.querySelector('.ans');
@@ -731,7 +801,7 @@ async function finalizeUtterance() {
     const resp = await fetch('/api/talk_stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio_wav_b64: b64, frames: framesToSend })
+      body: JSON.stringify({ text: userText, audio_wav_b64: wavB64, frames: framesToSend })
     });
 
     const reader = resp.body.getReader();
@@ -860,6 +930,8 @@ function hangup() {
   if (recorderNode) { try { recorderNode.disconnect(); } catch (e) {} }
   if (audioCtx) { try { audioCtx.close(); } catch (e) {} }
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  if (asrWS) { try { asrWS.send('close'); asrWS.close(); } catch (e) {} asrWS = null; }
+  asrFeeding = false;
   document.getElementById('call').style.display = 'none';
   const su = document.getElementById('startup');
   su.style.display = 'flex';

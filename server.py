@@ -26,7 +26,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import json as _json
@@ -41,6 +41,7 @@ from modules.cache import ResponseCache
 from modules.cost_tracker import CostTracker
 from modules.context import ConversationContext
 from modules.mode_prompts import MODE_PROMPTS, detect_mode_command
+from modules.asr_stream import StreamingASR
 
 vision = VisionModule()
 speech = SpeechModule()
@@ -187,14 +188,17 @@ def talk_stream(payload: dict = Body(...)):
     frames = [f for f in frames if f is not None]
     latest = frames[-1] if frames else None
 
+    # 优先用前端流式 ASR 已识别好的文字（省掉服务端再识别的~1秒）
+    user_text = (payload.get("text") or "").strip()
     audio_b64 = payload.get("audio_wav_b64", "")
-    user_text = ""
-    if audio_b64:
+    if not user_text and audio_b64:
         try:
             user_text = speech.transcribe_wav_bytes(base64.b64decode(audio_b64))
             cost_tracker.log("asr")
         except Exception as e:
             print(f"[stream asr error] {e}")
+    elif user_text:
+        cost_tracker.log("asr")
 
     def gen():
         if not user_text:
@@ -310,6 +314,44 @@ def scene(payload: dict = Body(...)):
     if mode == "chat" and text:
         context.add("assistant", text)
     return JSONResponse({"text": text or "", "cost": cost_tracker.get_report()})
+
+
+@app.websocket("/ws/asr")
+async def ws_asr(ws: WebSocket):
+    """流式语音识别。
+
+    前端在用户开始说话时连上，逐帧发送 16k 单声道 PCM(int16) 二进制；
+    说完发送文本消息 "end"，服务端返回 {"type":"final","text":...}。
+    边说边识别，说完即拿到文字，省掉服务端一次性识别的约 1 秒。
+    """
+    await ws.accept()
+    asr = None
+    try:
+        while True:
+            msg = await ws.receive()
+            if "bytes" in msg and msg["bytes"] is not None:
+                if asr is None:
+                    asr = StreamingASR()
+                    asr.start()
+                asr.feed(msg["bytes"])
+            elif "text" in msg and msg["text"] is not None:
+                cmd = msg["text"]
+                if cmd == "end":
+                    text = asr.finish() if asr else ""
+                    asr = None
+                    await ws.send_text(_json.dumps({"type": "final", "text": text}, ensure_ascii=False))
+                elif cmd == "close":
+                    break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        print(f"[ws_asr error] {e}")
+    finally:
+        if asr is not None:
+            try:
+                asr.finish()
+            except Exception:
+                pass
 
 
 def _sse(obj: dict) -> str:
