@@ -35,6 +35,11 @@ let silenceMs = 0;
 let speechMs = 0;
 let micSampleRate = 48000;
 
+// 摄像头切换（含广角）
+let videoDevices = [];      // 可用的后置摄像头 deviceId 列表
+let curCamIdx = 0;          // 当前镜头索引
+let switching = false;      // 切换中
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 1300;     // 停顿多久算一句结束
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -135,6 +140,37 @@ function speakLocal(text) {
   });
 }
 
+// speakPrompt：提示/状态类播报。优先浏览器本地语音（即时）；
+// 若没有可用的本地中文语音（很多手机如此），自动回退云端 CosyVoice，保证有声。
+// 关键：无论如何都有超时兜底释放 ttsPlaying，绝不让 VAD 永久收不到音。
+function speakPrompt(text, onend) {
+  if (!text) { if (onend) onend(); return; }
+
+  const voices = (window.speechSynthesis && speechSynthesis.getVoices()) || [];
+  const hasLocalZh = !!zhVoice || voices.some(v => /zh|cmn|chinese/i.test(v.lang));
+
+  // 没有本地中文语音 → 回退云端（和回答同一通道，有声保底）
+  if (!window.speechSynthesis || !hasLocalZh) {
+    ttsPlaying = true;
+    speak(text, { interrupt: true });
+    waitSpeechDone(() => { ttsPlaying = false; if (onend) onend(); });
+    return;
+  }
+
+  // 本地语音
+  try { speechSynthesis.cancel(); } catch (e) {}
+  ttsPlaying = true;
+  let released = false;
+  const release = () => { if (released) return; released = true; ttsPlaying = false; if (onend) onend(); };
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = 'zh-CN'; u.rate = 1.08;
+  if (zhVoice) u.voice = zhVoice;
+  u.onend = release; u.onerror = release;
+  try { speechSynthesis.speak(u); } catch (e) { release(); return; }
+  // 超时兜底：按字数从宽估算时长，仅在 onend 不触发时兜底，避免误打断正常播报
+  setTimeout(release, 3000 + text.length * 300);
+}
+
 // ===== 接通 =====
 const callBtn = document.getElementById('call-btn');
 callBtn.addEventListener('click', startCall);
@@ -147,7 +183,7 @@ let welcomed = false;
 function announceWelcome() {
   if (welcomed) return;
   welcomed = true;
-  speak(WELCOME_TEXT, { interrupt: true });
+  speakPrompt(WELCOME_TEXT);   // 引导语走浏览器本地语音，即时可靠
 }
 
 // 先尝试直接发声（部分桌面浏览器允许）；移动端会被拦截，等首次触摸兜底
@@ -164,10 +200,32 @@ function firstInteractionFallback(e) {
 }
 window.addEventListener('pointerdown', firstInteractionFallback);
 
+// 在用户手势内解锁音频通道。手机浏览器要求音频/语音首次播放必须由用户交互触发，
+// 否则之后所有云端语音(<audio>)和本地语音(speechSynthesis)都会被静音。
+// 接通按钮不出提示音，但用一段无声音频解锁通道，保证后续回答能发声。
+let audioUnlocked = false;
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  try {
+    const buf = encodeWav16k(new Float32Array(800), 16000);  // 约0.05秒静音
+    ttsPlayer.src = 'data:audio/wav;base64,' + arrayBufferToBase64(buf);
+    const p = ttsPlayer.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+  try {
+    if (window.speechSynthesis) {
+      const u = new SpeechSynthesisUtterance(' ');
+      u.volume = 0;
+      speechSynthesis.speak(u);
+    }
+  } catch (e) {}
+}
+
 async function startCall() {
   welcomed = true;   // 进入接通流程后不再念欢迎语
-  // 点击反馈：告知正在请求权限，并提示在同一位置再次点击允许
-  speak('正在开启摄像头和麦克风。如果弹出权限提示，请点击允许。', { interrupt: true });
+  unlockAudio();     // 必须在 await 之前（仍在点击手势内）解锁音频
+  // 接通按钮本身不出提示音（屏幕阅读器旁白会朗读按钮）
 
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -175,7 +233,7 @@ async function startCall() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
   } catch (e) {
-    speak('没有获得摄像头或麦克风权限。请刷新页面，在弹出的提示中点击允许。', { interrupt: true });
+    speakPrompt('没有获得摄像头或麦克风权限。请刷新页面，在弹出的提示中点击允许。');
     showPermissionError(e);
     return;
   }
@@ -186,12 +244,81 @@ async function startCall() {
   document.getElementById('call').style.display = 'block';
 
   video.srcObject = mediaStream;
+  // 显式播放，修复部分手机首次进入黑屏（autoplay 不总是生效）
+  try { await video.play(); } catch (e) {}
 
   startFrameCapture();
   startVAD();
   setStatus('正在聆听…请说出你的问题', '#2ecc71');
-  // 成功进入通话界面的语音提示
-  speak('已接通。现在可以对准物品，直接说出你的问题，比如：这是什么。说完停顿一下，我就会回答。', { interrupt: true });
+  // 「正在聆听」提示走浏览器本地语音（即时，不受云端延迟影响）
+  speakPrompt('正在聆听，请对准物品说出您的问题');
+
+  // 枚举可用摄像头（含广角），决定是否显示切换按钮
+  await setupCameras();
+}
+
+// 从镜头标签推断类型。手机广角/长焦在 label 里常有关键词；拿不到则返回空。
+function lensName(label) {
+  const s = label || '';
+  if (/超广|ultra.?wide|ultrawide|0\.5\s*x?/i.test(s)) return '广角镜头';
+  if (/广角/.test(s)) return '广角镜头';
+  if (/长焦|tele|telephoto|[2-9]\s*[xX×]/.test(s)) return '长焦镜头';
+  if (/主摄|\bmain\b/i.test(s)) return '主摄像头';
+  return '';
+}
+
+// 枚举后置摄像头（保存 id+label 以判断镜头类型）。手机广角是独立镜头，靠切换 deviceId 访问。
+async function setupCameras() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    const back = cams.filter(d => /back|rear|后|environment/i.test(d.label));
+    const pool = (back.length ? back : cams).filter(d => d.deviceId);
+    // 去重
+    const seen = new Set();
+    videoDevices = [];
+    for (const d of pool) {
+      if (seen.has(d.deviceId)) continue;
+      seen.add(d.deviceId);
+      videoDevices.push({ id: d.deviceId, label: d.label || '' });
+    }
+
+    // 当前正在用的镜头排到索引 0
+    const curId = mediaStream.getVideoTracks()[0]?.getSettings?.().deviceId;
+    const i = videoDevices.findIndex(d => d.id === curId);
+    if (i > 0) { const [cur] = videoDevices.splice(i, 1); videoDevices.unshift(cur); }
+    curCamIdx = 0;
+
+    const btn = document.getElementById('cam-btn');
+    if (btn) btn.style.display = videoDevices.length > 1 ? 'block' : 'none';
+  } catch (e) {
+    console.warn('enumerateDevices 失败', e);
+  }
+}
+
+// 切换镜头：只换视频轨，保留麦克风与 VAD 不中断。提示音走浏览器本地语音（即时可靠）。
+async function switchCamera() {
+  if (switching || videoDevices.length < 2) return;
+  switching = true;
+  curCamIdx = (curCamIdx + 1) % videoDevices.length;
+  const dev = videoDevices[curCamIdx];
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: dev.id }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    mediaStream.getVideoTracks().forEach(t => { t.stop(); mediaStream.removeTrack(t); });
+    mediaStream.addTrack(newStream.getVideoTracks()[0]);
+    video.srcObject = mediaStream;
+    try { await video.play(); } catch (e) {}
+    // 能从标签判断就报具体类型，判断不出就只报第几个镜头（不瞎猜广角）
+    const name = lensName(dev.label) || ('第' + (curCamIdx + 1) + '个镜头');
+    speakPrompt('已切换到' + name);
+  } catch (e) {
+    console.warn('切换镜头失败', e);
+    speakPrompt('这个镜头切换失败了，请再点一次试试其他镜头');
+  }
+  switching = false;
 }
 
 function showPermissionError(e) {
@@ -206,17 +333,23 @@ function showPermissionError(e) {
   hint.style.display = 'flex';
 }
 
-// ===== 持续抓帧 =====
+// ===== 抓帧 =====
+const _capCanvas = document.createElement('canvas');
+const _capCtx = _capCanvas.getContext('2d');
+
+// 抓当前这一刻的画面，返回 data URL（拿不到画面返回 null）
+function captureFrameNow() {
+  if (!video.videoWidth) return null;
+  const w = 640, h = Math.round(video.videoHeight * 640 / video.videoWidth);
+  _capCanvas.width = w; _capCanvas.height = h;
+  _capCtx.drawImage(video, 0, 0, w, h);
+  return _capCanvas.toDataURL('image/jpeg', 0.78);
+}
+
 function startFrameCapture() {
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
   frameTimer = setInterval(() => {
-    if (!video.videoWidth) return;
-    // 缩放到 512 宽，降低上传体积与延迟
-    const w = 512, h = Math.round(video.videoHeight * 512 / video.videoWidth);
-    canvas.width = w; canvas.height = h;
-    ctx.drawImage(video, 0, 0, w, h);
-    const url = canvas.toDataURL('image/jpeg', 0.72);
+    const url = captureFrameNow();
+    if (!url) return;
     recentFrames.push(url);
     if (recentFrames.length > MAX_FRAMES) recentFrames.shift();
   }, FRAME_INTERVAL_MS);
@@ -290,34 +423,19 @@ async function finalizeUtterance() {
   const ansEl = answerBox.querySelector('.ans');
   const heardEl = answerBox.querySelector('.heard');
 
-  let spokenUpto = 0;   // 已朗读到的字符位置
   let fullAnswer = '';
-  let answered = false;
+  let errored = false;
 
-  // 把已累积、未朗读、且以句末标点结尾的整句念出来
-  function flushSpeech(force) {
-    const pending = fullAnswer.slice(spokenUpto);
-    if (!pending) return;
-    // 找最后一个句末标点
-    const m = pending.match(/^[\s\S]*[。！？!?，,；;\n]/);
-    let seg = '';
-    if (m) seg = m[0];
-    else if (force) seg = pending;
-    if (seg) {
-      spokenUpto += seg.length;
-      const clean = seg.replace(/[*#`>\-]/g, '').trim();
-      if (clean) {
-        setStatus('正在回答…', '#9b59b6');
-        speak(clean);
-      }
-    }
-  }
+  // 抓「此刻」的画面作为主画面，保证所见即所问（避免用到旧帧导致答非所见）
+  const freshFrame = captureFrameNow();
+  const framesToSend = recentFrames.slice();
+  if (freshFrame) framesToSend.push(freshFrame);   // 放最后 = 服务端取的 latest
 
   try {
     const resp = await fetch('/api/talk_stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ audio_wav_b64: b64, frames: recentFrames.slice() })
+      body: JSON.stringify({ audio_wav_b64: b64, frames: framesToSend })
     });
 
     const reader = resp.body.getReader();
@@ -339,29 +457,32 @@ async function finalizeUtterance() {
         if (evt.type === 'heard') {
           heardEl.textContent = '🗣️ ' + (evt.text || '');
         } else if (evt.type === 'delta') {
-          answered = true;
           fullAnswer += evt.text;
-          ansEl.textContent = fullAnswer;
-          flushSpeech(false);
+          ansEl.textContent = fullAnswer;   // 文字实时显示
         } else if (evt.type === 'done') {
-          flushSpeech(true);   // 念完剩余
           if (evt.cost) costPanel.textContent = evt.cost;
         } else if (evt.type === 'error') {
+          errored = true;
           ansEl.textContent = evt.text || '出错了';
-          speak(evt.text || '出错了');
+          fullAnswer = evt.text || '出错了';
         }
       }
     }
   } catch (e) {
     console.error(e);
+    errored = true;
     setStatus('网络出错，请重试', '#e74c3c');
-    speak('网络好像出问题了，请再说一遍。');
+    fullAnswer = '网络好像出问题了，请再说一遍。';
   }
 
-  // 等浏览器把话说完再恢复收音，避免把自己的声音当成提问
-  waitSpeechDone(() => {
-    ttsPlaying = false; isProcessing = false;
+  // 回答整段一次性播报：端侧优先（更快），无本地语音时自动回退云端。
+  // 播完后提示「可继续提问」，再恢复收音。
+  const toSpeak = fullAnswer.replace(/[*#`>\-]/g, '').trim() || '我没有看清，请再说一遍。';
+  if (!errored) setStatus('正在回答…', '#9b59b6');
+  speakPrompt(toSpeak, () => {
+    isProcessing = false;
     setStatus('正在聆听…请继续提问', '#2ecc71');
+    speakPrompt('您可以继续提问', () => { ttsPlaying = false; });
   });
 }
 
@@ -440,12 +561,17 @@ function hangup() {
   su.style.display = 'flex';
   su.style.opacity = '1';
   recentFrames = []; pcmBuffer = []; recording = false; isProcessing = false; ttsPlaying = false;
+  videoDevices = []; curCamIdx = 0; switching = false;
   answerBox.style.display = 'none';
-  // 挂断语音提示
-  speak('通话已结束。需要时请再次点击接通按钮。', { interrupt: true });
+  // 挂断不出提示音（屏幕阅读器旁白会朗读按钮状态）
+  if (window.speechSynthesis) speechSynthesis.cancel();
 }
 
 // ===== 成本面板开关 =====
 document.getElementById('cost-toggle').addEventListener('click', () => {
   costPanel.style.display = costPanel.style.display === 'block' ? 'none' : 'block';
 });
+
+// ===== 切换镜头（含广角） =====
+const camBtn = document.getElementById('cam-btn');
+if (camBtn) camBtn.addEventListener('click', switchCamera);

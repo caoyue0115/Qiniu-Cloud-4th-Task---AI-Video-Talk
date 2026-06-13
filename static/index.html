@@ -68,14 +68,19 @@
   }
   #answer-box .heard { color: #8fd0ff; font-size: 0.95rem; margin-bottom: 6px; }
 
-  #hangup-btn {
-    position: fixed; left: 50%; bottom: 40px; transform: translateX(-50%); z-index: 7;
-    width: 84px; height: 84px; border-radius: 50%; border: none; cursor: pointer;
-    background: #e74c3c; color: #fff; font-size: 2.0rem;
-    box-shadow: 0 6px 24px rgba(231,76,60,.5);
-    display: flex; align-items: center; justify-content: center;
+  /* 底部控制栏：大号文字按钮，便于屏幕阅读器朗读与点选 */
+  #controls {
+    position: fixed; left: 0; right: 0; bottom: 28px; z-index: 7;
+    display: flex; justify-content: center; gap: 18px; padding: 0 16px;
   }
-  #hangup-btn:active { transform: translateX(-50%) scale(0.92); }
+  #controls button {
+    flex: 1; max-width: 220px; min-height: 76px; border: none; border-radius: 18px;
+    color: #fff; font-size: 1.35rem; font-weight: 600; letter-spacing: 2px; cursor: pointer;
+    box-shadow: 0 6px 22px rgba(0,0,0,.45);
+  }
+  #cam-btn { background: #2980d6; display: none; }
+  #hangup-btn { background: #e74c3c; }
+  #controls button:active { transform: scale(0.95); }
 
   #cost-toggle {
     position: fixed; top: 16px; right: 16px; z-index: 8;
@@ -122,10 +127,13 @@
     <div id="status-dot"></div>
     <div id="status-text">正在聆听…请说出你的问题</div>
   </div>
-  <button id="cost-toggle">成本</button>
+  <button id="cost-toggle" aria-label="查看成本统计">成本</button>
   <div id="cost-panel"></div>
   <div id="answer-box"></div>
-  <button id="hangup-btn" title="挂断">📵</button>
+  <div id="controls">
+    <button id="cam-btn" aria-label="切换摄像头镜头，可切换到广角">切换镜头</button>
+    <button id="hangup-btn" aria-label="挂断通话，结束对话">挂断通话</button>
+  </div>
 </div>
 
 <!-- 权限提示 -->
