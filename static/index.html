@@ -29,6 +29,11 @@
   .startup-sub {
     color: #9fb4d8; font-size: 1.0rem; letter-spacing: 2px; margin-bottom: 3rem; z-index: 2; text-align: center;
   }
+  .startup-hint {
+    color: #cfe3ff; font-size: 1.05rem; letter-spacing: 1px; margin-top: 1.8rem; z-index: 2;
+    animation: hintblink 2.4s infinite ease-in-out;
+  }
+  @keyframes hintblink { 0%,100% { opacity: 0.45; } 50% { opacity: 1; } }
   #call-btn {
     width: 150px; height: 150px; border-radius: 50%; border: none; cursor: pointer; z-index: 2;
     background: linear-gradient(145deg, #2ecc71, #27ae60);
@@ -107,6 +112,7 @@
     <span class="icon">📞</span>
     <span>接通</span>
   </button>
+  <div class="startup-hint">👆 点击上方按钮开始</div>
 </div>
 
 <!-- 通话画面 -->

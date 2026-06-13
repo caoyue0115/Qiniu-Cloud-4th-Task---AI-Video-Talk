@@ -139,24 +139,33 @@ function speakLocal(text) {
 const callBtn = document.getElementById('call-btn');
 callBtn.addEventListener('click', startCall);
 
-// 进入网页即语音提示（需用户首次交互后才能发声，故首次触摸也触发）
-function announceWelcome() {
-  speak('欢迎使用 AI 视觉助手。请点击屏幕中间的接通按钮，开始通话。', { interrupt: true });
-}
-// 首次任意触摸/点击解锁语音（浏览器策略）并播报欢迎
+// 进入网页的引导。浏览器自动播放策略：用户首次交互前禁止出声，
+// 故采用「视觉提示常驻（HTML 里的闪烁文字）+ 首次触摸即语音欢迎」双保险。
+const WELCOME_TEXT = '欢迎使用 AI 视觉助手。请点击屏幕中间的接通按钮，开始通话。';
 let welcomed = false;
-function tryWelcome() {
+
+function announceWelcome() {
   if (welcomed) return;
   welcomed = true;
-  announceWelcome();
+  speak(WELCOME_TEXT, { interrupt: true });
 }
-window.addEventListener('pointerdown', tryWelcome, { once: true });
+
+// 先尝试直接发声（部分桌面浏览器允许）；移动端会被拦截，等首次触摸兜底
 window.addEventListener('load', () => {
-  // 部分浏览器允许 load 后直接发声，尝试一次（失败则等首次触摸）
-  setTimeout(() => { if (!welcomed) { announceWelcome(); welcomed = true; } }, 600);
+  setTimeout(() => { if (!welcomed) announceWelcome(); }, 300);
 });
 
+// 首次触摸兜底：若自动播放被拦，用户第一次碰屏幕即补播欢迎语。
+// 若首次碰的就是「接通」按钮，则交给 startCall，不重复念欢迎语。
+function firstInteractionFallback(e) {
+  if (welcomed) return;
+  if (e.target && e.target.closest && e.target.closest('#call-btn')) return;
+  announceWelcome();
+}
+window.addEventListener('pointerdown', firstInteractionFallback);
+
 async function startCall() {
+  welcomed = true;   // 进入接通流程后不再念欢迎语
   // 点击反馈：告知正在请求权限，并提示在同一位置再次点击允许
   speak('正在开启摄像头和麦克风。如果弹出权限提示，请点击允许。', { interrupt: true });
 
