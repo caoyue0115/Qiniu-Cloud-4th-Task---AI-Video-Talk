@@ -53,11 +53,10 @@ function setStatus(text, color) {
   if (color) statusDot.style.background = color;
 }
 
-// ===== 浏览器本地语音（零延迟、零成本、离线可用）：用于引导提示与回答播报 =====
+// ===== 语音播报：优先云端 CosyVoice（自然），失败回退浏览器本地语音 =====
 let zhVoice = null;
 function pickVoice() {
   const voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
-  // 优先中文女声
   zhVoice = voices.find(v => /zh|chinese|cmn/i.test(v.lang) && /female|woman|xiao|mei|ting/i.test(v.name))
          || voices.find(v => /zh|chinese|cmn/i.test(v.lang))
          || voices[0] || null;
@@ -67,16 +66,73 @@ if (window.speechSynthesis) {
   speechSynthesis.onvoiceschanged = pickVoice;
 }
 
-// speak: 朗读一句话。interrupt=true 会打断当前播报。onend 回调可选。
+// 播报队列：CosyVoice 合成有延迟，用队列保证多句按序播放、不重叠
+const ttsQueue = [];
+let ttsBusy = false;
+
+// speak: 朗读一句话。opts.interrupt=true 清空队列并打断当前。opts.onend 全部播完回调。
 function speak(text, opts = {}) {
-  if (!window.speechSynthesis || !text) { if (opts.onend) opts.onend(); return; }
-  if (opts.interrupt) speechSynthesis.cancel();
-  const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'zh-CN';
-  u.rate = 1.05;
-  if (zhVoice) u.voice = zhVoice;
-  if (opts.onend) u.onend = opts.onend;
-  speechSynthesis.speak(u);
+  if (!text) { if (opts.onend) opts.onend(); return; }
+  if (opts.interrupt) {
+    ttsQueue.length = 0;
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    try { ttsPlayer.pause(); } catch (e) {}
+  }
+  ttsQueue.push({ text, onend: opts.onend });
+  pumpQueue();
+}
+
+async function pumpQueue() {
+  if (ttsBusy) return;
+  const item = ttsQueue.shift();
+  if (!item) return;
+  ttsBusy = true;
+  try {
+    const mp3 = await synthCosyVoice(item.text);
+    if (mp3) {
+      await playMp3(mp3);
+    } else {
+      await speakLocal(item.text);   // 回退浏览器本地语音
+    }
+  } catch (e) {
+    await speakLocal(item.text).catch(() => {});
+  }
+  ttsBusy = false;
+  if (item.onend && ttsQueue.length === 0) item.onend();
+  if (ttsQueue.length) pumpQueue();
+}
+
+// 调后端 CosyVoice，返回 mp3 base64（失败返回空）
+async function synthCosyVoice(text) {
+  try {
+    const resp = await fetch('/api/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+    const data = await resp.json();
+    return data.audio_mp3_b64 || '';
+  } catch (e) { return ''; }
+}
+
+function playMp3(b64) {
+  return new Promise((resolve) => {
+    ttsPlayer.src = 'data:audio/mp3;base64,' + b64;
+    ttsPlayer.onended = resolve;
+    ttsPlayer.onerror = resolve;
+    ttsPlayer.play().catch(resolve);
+  });
+}
+
+function speakLocal(text) {
+  return new Promise((resolve) => {
+    if (!window.speechSynthesis) { resolve(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'zh-CN'; u.rate = 1.05;
+    if (zhVoice) u.voice = zhVoice;
+    u.onend = resolve; u.onerror = resolve;
+    speechSynthesis.speak(u);
+  });
 }
 
 // ===== 接通 =====
@@ -300,16 +356,17 @@ async function finalizeUtterance() {
   });
 }
 
-// 轮询直到 speechSynthesis 播报队列清空
+// 轮询直到所有播报（CosyVoice 队列 + 浏览器本地）都结束
 function waitSpeechDone(cb) {
-  if (!window.speechSynthesis) { cb(); return; }
   const timer = setInterval(() => {
-    if (!speechSynthesis.speaking && !speechSynthesis.pending) {
+    const localBusy = window.speechSynthesis && (speechSynthesis.speaking || speechSynthesis.pending);
+    const queueBusy = ttsBusy || ttsQueue.length > 0;
+    if (!localBusy && !queueBusy) {
       clearInterval(timer); cb();
     }
   }, 250);
-  // 兜底：最多等 12 秒
-  setTimeout(() => { clearInterval(timer); cb(); }, 12000);
+  // 兜底：最多等 15 秒
+  setTimeout(() => { clearInterval(timer); cb(); }, 15000);
 }
 
 // ===== WAV 编码（重采样到 16k 单声道 PCM16） =====

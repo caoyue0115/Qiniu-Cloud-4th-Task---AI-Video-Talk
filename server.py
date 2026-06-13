@@ -243,6 +243,22 @@ def talk_stream(payload: dict = Body(...)):
     return StreamingResponse(gen(), media_type="text/event-stream")
 
 
+@app.post("/api/tts")
+def tts(payload: dict = Body(...)):
+    """文字转语音：返回 CosyVoice 合成的 MP3（base64）。
+
+    供前端统一播报引导语与回答，音质自然。失败返回空串，前端可回退本地语音。
+    """
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"audio_mp3_b64": ""})
+    audio_bytes = speech.synthesize_bytes(text)
+    if not audio_bytes:
+        return JSONResponse({"audio_mp3_b64": ""})
+    cost_tracker.log("tts")
+    return JSONResponse({"audio_mp3_b64": base64.b64encode(audio_bytes).decode()})
+
+
 def _sse(obj: dict) -> str:
     return "data: " + _json.dumps(obj, ensure_ascii=False) + "\n\n"
 
