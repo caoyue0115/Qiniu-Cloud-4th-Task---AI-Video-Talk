@@ -46,10 +46,6 @@ let modeLoopTimer = null;   // 模式周期循环
 let chatIdleTimer = null;   // 聊天空闲计时
 let bgBusy = false;         // 后台图像识别(导航/聊天)在途——不屏蔽麦克风，与语音识别并行
 
-// 流式 ASR：边说边识别，省掉服务端一次性识别的~1秒
-let asrWS = null;           // 持久 WebSocket
-let asrFeeding = false;     // 当前句是否已开始喂音频
-
 // 语速倍率（盲人常偏好快语速），范围 0.6~2.0，本地持久化
 let speechRate = parseFloat(localStorage.getItem('speechRate') || '1') || 1;
 speechRate = Math.min(2.0, Math.max(0.6, speechRate));
@@ -66,8 +62,8 @@ const FRAME_INTERVAL_MS = 700;    // 抓帧间隔
 const MAX_FRAMES = 3;             // 最多保留帧数
 
 // 语音打断（barge-in）：AI 朗读时用户开口可打断
-const BARGE_THRESHOLD = 0.06;     // 打断阈值（明显高于静音阈值，避开AI漏音）
-const BARGE_HANG_MS = 280;        // 持续这么久的较大音量才算用户打断
+const BARGE_THRESHOLD = 0.05;     // 打断阈值（高于静音阈值，避开AI漏音）
+const BARGE_HANG_MS = 240;        // 持续这么久的较大音量才算用户打断
 let bargeMs = 0;
 let aiSpeaking = false;            // AI 正在朗读回答/内容（可被打断；区别于"思考中"）
 
@@ -293,7 +289,6 @@ async function startCall() {
 
   startFrameCapture();
   startVAD();
-  asrConnect();   // 开启流式识别通道
   currentMode = 'qa'; setModeIndicator();
   setStatus('正在聆听…请说出你的问题', '#2ecc71');
   // 「正在聆听」提示走浏览器本地语音（即时，不受云端延迟影响）
@@ -803,61 +798,6 @@ function startFrameCapture() {
 }
 
 // ===== VAD：Web Audio 实时音量检测 =====
-// ===== 流式 ASR 客户端 =====
-function asrConnect() {
-  try {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    asrWS = new WebSocket(`${proto}://${location.host}/ws/asr`);
-    asrWS.binaryType = 'arraybuffer';
-    asrWS.onclose = () => { asrWS = null; };
-    asrWS.onerror = () => {};
-  } catch (e) { asrWS = null; }
-}
-
-function asrReady() {
-  return asrWS && asrWS.readyState === WebSocket.OPEN;
-}
-
-// 把一帧 Float32 音频重采样为 16k int16 PCM 并通过 WS 发送
-function asrFeed(float32, inRate) {
-  if (!asrReady()) return;
-  let data = float32;
-  if (inRate !== 16000) {
-    const ratio = inRate / 16000;
-    const newLen = Math.round(float32.length / ratio);
-    const out = new Float32Array(newLen);
-    for (let i = 0; i < newLen; i++) {
-      const idx = i * ratio, lo = Math.floor(idx), hi = Math.min(lo + 1, float32.length - 1);
-      out[i] = float32[lo] + (float32[hi] - float32[lo]) * (idx - lo);
-    }
-    data = out;
-  }
-  const buf = new ArrayBuffer(data.length * 2);
-  const view = new DataView(buf);
-  for (let i = 0; i < data.length; i++) {
-    let s = Math.max(-1, Math.min(1, data[i]));
-    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  try { asrWS.send(buf); } catch (e) {}
-}
-
-// 结束当前句，返回识别文字（失败/超时返回空，由调用方回退）
-function asrFinishText() {
-  return new Promise((resolve) => {
-    asrFeeding = false;
-    if (!asrReady()) { resolve(''); return; }
-    let done = false;
-    const onMsg = (ev) => {
-      try {
-        const d = JSON.parse(ev.data);
-        if (d.type === 'final') { done = true; asrWS.removeEventListener('message', onMsg); resolve((d.text || '').trim()); }
-      } catch (e) {}
-    };
-    asrWS.addEventListener('message', onMsg);
-    try { asrWS.send('end'); } catch (e) { asrWS.removeEventListener('message', onMsg); resolve(''); return; }
-    setTimeout(() => { if (!done) { asrWS.removeEventListener('message', onMsg); resolve(''); } }, 2000);
-  });
-}
 
 function startVAD() {
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -898,17 +838,13 @@ function startVAD() {
 
     if (rms > SILENCE_THRESHOLD) {
       // 有声音
-      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; asrFeeding = asrReady(); buzz(25); setStatus('正在聆听…', '#f1c40f'); }
-      const frame = new Float32Array(input);
-      pcmBuffer.push(frame);
-      if (asrFeeding) asrFeed(input, micSampleRate);   // 边说边流式识别
+      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; buzz(25); setStatus('正在聆听…', '#f1c40f'); }
+      pcmBuffer.push(new Float32Array(input));
       speechMs += frameMs;
       silenceMs = 0;
     } else if (recording) {
-      // 说话后的静音（也喂给 ASR，帮助断句）
-      const frame = new Float32Array(input);
-      pcmBuffer.push(frame);
-      if (asrFeeding) asrFeed(input, micSampleRate);
+      // 说话后的静音
+      pcmBuffer.push(new Float32Array(input));
       silenceMs += frameMs;
       if (silenceMs >= SILENCE_HANG_MS) {
         // 一句话结束
@@ -926,7 +862,19 @@ function startVAD() {
   processor.connect(audioCtx.destination);
 }
 
-// ===== 一句话结束：优先用流式识别结果，回退 WAV =====
+// 一次性识别：上传 WAV，返回文字（失败返回空）
+async function asrOnce(wavB64) {
+  try {
+    const resp = await fetch('/api/asr', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ audio_wav_b64: wavB64 })
+    });
+    const data = await resp.json();
+    return (data.text || '').trim();
+  } catch (e) { return ''; }
+}
+
+// ===== 一句话结束：一次性识别（稳定可靠），拿到文字后做模式分流 =====
 async function finalizeUtterance() {
   const chunks = pcmBuffer;
   pcmBuffer = [];
@@ -934,20 +882,29 @@ async function finalizeUtterance() {
 
   isProcessing = true;
   ttsPlaying = true;   // 占用收音，避免边问边触发
-  setStatus('正在看 · 正在思考…', '#3498db');
+  setStatus('正在识别…', '#3498db');
 
-  // 先拿流式识别文字（说完即得，省~1秒）；为空则回退到 WAV 上传识别
-  const streamedText = await asrFinishText();
-  let userText = streamedText;
-  let wavB64 = '';
+  // 合成 16k WAV
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const merged = new Float32Array(total);
+  let off = 0;
+  for (const c of chunks) { merged.set(c, off); off += c.length; }
+  const wavB64 = arrayBufferToBase64(encodeWav16k(merged, micSampleRate));
+
+  // 一次性识别（可靠），并自动重试一次，避免偶发失败
+  let userText = await asrOnce(wavB64);
+  if (!userText) userText = await asrOnce(wavB64);
+
   if (!userText) {
-    let total = 0;
-    for (const c of chunks) total += c.length;
-    const merged = new Float32Array(total);
-    let off = 0;
-    for (const c of chunks) { merged.set(c, off); off += c.length; }
-    wavB64 = arrayBufferToBase64(encodeWav16k(merged, micSampleRate));
+    // 实在没识别到：提示重说，恢复收音
+    isProcessing = false; ttsPlaying = false;
+    setStatus('没听清，请再说一遍', '#e74c3c');
+    speakPrompt('没听清，请再说一遍。', () => { ttsPlaying = false; });
+    return;
   }
+
+  setStatus('正在思考…', '#3498db');
 
   // 客户端语音指令（语速/重播/帮助）：命中则本地处理，不发给 AI
   if (userText && handleClientCommand(userText)) return;
@@ -1128,8 +1085,6 @@ function hangup() {
   if (recorderNode) { try { recorderNode.disconnect(); } catch (e) {} }
   if (audioCtx) { try { audioCtx.close(); } catch (e) {} }
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-  if (asrWS) { try { asrWS.send('close'); asrWS.close(); } catch (e) {} asrWS = null; }
-  asrFeeding = false;
   document.getElementById('call').style.display = 'none';
   const su = document.getElementById('startup');
   su.style.display = 'flex';
@@ -1151,3 +1106,14 @@ document.getElementById('cost-toggle').addEventListener('click', () => {
 // ===== 切换镜头（含广角） =====
 const camBtn = document.getElementById('cam-btn');
 if (camBtn) camBtn.addEventListener('click', switchCamera);
+
+// ===== 点击画面打断 =====
+// 盲人摸到屏幕一点即可打断 AI 朗读（比语音打断更可靠的兜底）
+function interruptSpeech() {
+  if (!aiSpeaking) return;
+  stopAllSpeech();
+  aiSpeaking = false; ttsPlaying = false; isProcessing = false; bargeMs = 0;
+  buzz(25);
+  setStatus('已打断，请说', '#2ecc71');
+}
+video.addEventListener('click', interruptSpeech);
