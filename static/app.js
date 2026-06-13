@@ -67,6 +67,11 @@ function setStatus(text, color) {
   if (color) statusDot.style.background = color;
 }
 
+// 触觉反馈：盲人靠听+触确认状态，震动给非视觉提示（仅安卓支持，iOS 自动忽略）
+function buzz(pattern) {
+  try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) {}
+}
+
 // ===== 语音播报：优先云端 CosyVoice（自然），失败回退浏览器本地语音 =====
 let zhVoice = null;
 function pickVoice() {
@@ -552,7 +557,9 @@ function handleDetections(preds) {
   if (navLastAlert[key] && now - navLastAlert[key] < 4000) return;  // 同类同方位 4 秒不重复
   navLastAlert[key] = now;
   navLastAnyAlert = now;
-  const near = best.areaRatio > 0.22 ? '很近，' : '';
+  const isNear = best.areaRatio > 0.22;
+  buzz(isNear ? [0, 90, 50, 90] : 50);   // 近距离危险用急促双震，远处单震
+  const near = isNear ? '很近，' : '';
   speakPrompt(`${best.zone}${near}有${best.cn}`);   // 实时告警走端侧语音，即时
 }
 
@@ -733,7 +740,7 @@ function startVAD() {
 
     if (rms > SILENCE_THRESHOLD) {
       // 有声音
-      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; asrFeeding = asrReady(); setStatus('正在聆听…', '#f1c40f'); }
+      if (!recording) { recording = true; speechMs = 0; pcmBuffer = []; asrFeeding = asrReady(); buzz(25); setStatus('正在聆听…', '#f1c40f'); }
       const frame = new Float32Array(input);
       pcmBuffer.push(frame);
       if (asrFeeding) asrFeed(input, micSampleRate);   // 边说边流式识别
@@ -853,6 +860,7 @@ async function finalizeUtterance() {
 
   // 回答整段一次性播报：端侧优先（更快）。播完立即恢复收音，不再加额外提示，降低对话循环延迟。
   const toSpeak = fullAnswer.replace(/[*#`>\-]/g, '').trim() || '我没有看清，请再说一遍。';
+  buzz(60);   // 答案就绪：震动提示（非视觉确认）
   if (!errored) setStatus('正在回答…', '#9b59b6');
   speakPrompt(toSpeak, () => {
     isProcessing = false; ttsPlaying = false;
