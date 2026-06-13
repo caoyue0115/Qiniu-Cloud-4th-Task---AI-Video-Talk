@@ -1104,7 +1104,25 @@ function hangup() {
 // ===== ⚡ 实时模式（Qwen-Omni-Realtime）=====
 let rtActive = false, rtWS = null, rtMicCtx = null, rtMicNode = null;
 let rtPlayCtx = null, rtPlayHead = 0, rtSources = [], rtFrameTimer = null;
+let rtCostTimer = null, rtStartMs = 0;
+const RT_RATE_PER_MIN = 0.4;   // 实时模式按通话时长计费（预估，元/分钟，以实际计费为准）
 const rtCanvas = document.createElement('canvas'), rtCtx2d = rtCanvas.getContext('2d');
+
+// 实时模式按通话时长更新成本面板（让仪表盘可读，区别于稳定模式的按次成本）
+function rtUpdateCost() {
+  const sec = Math.max(0, Math.floor((perfNow() - rtStartMs) / 1000));
+  const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  const cost = (sec / 60 * RT_RATE_PER_MIN).toFixed(3);
+  costPanel.textContent =
+    '📊 成本统计（实时模式）\n────────────────────────────\n' +
+    '实时对话 ×1 ¥' + cost + '\n' +
+    '────────────────────────────\n' +
+    '计费方式：按通话时长（约¥' + RT_RATE_PER_MIN + '/分钟）\n' +
+    '已通话：' + mm + ':' + ss + '\n' +
+    '累计成本：¥' + cost;
+}
+function perfNow() { return (performance && performance.now) ? performance.now() : 0; }
 
 document.getElementById('rt-btn').addEventListener('click', startRealtime);
 
@@ -1129,7 +1147,12 @@ async function startRealtime() {
 
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   rtWS = new WebSocket(`${proto}://${location.host}/ws/realtime`);
-  rtWS.onopen = () => { rtStartMic(); rtStartFrames(); };
+  rtWS.onopen = () => {
+    rtStartMic(); rtStartFrames();
+    rtStartMs = perfNow();
+    rtUpdateCost();
+    rtCostTimer = setInterval(rtUpdateCost, 1000);   // 按时长实时更新成本
+  };
   rtWS.onmessage = (ev) => rtHandle(JSON.parse(ev.data));
   rtWS.onclose = () => { if (rtActive) setStatus('实时连接已断开', '#e74c3c'); };
   rtWS.onerror = () => {};
@@ -1227,6 +1250,7 @@ function stopRealtime() {
   if (!rtActive) return;
   rtActive = false;
   if (rtFrameTimer) { clearInterval(rtFrameTimer); rtFrameTimer = null; }
+  if (rtCostTimer) { clearInterval(rtCostTimer); rtCostTimer = null; }
   rtStopPlayback();
   if (rtMicNode) { try { rtMicNode.disconnect(); } catch (e) {} rtMicNode = null; }
   if (rtMicCtx) { try { rtMicCtx.close(); } catch (e) {} rtMicCtx = null; }
