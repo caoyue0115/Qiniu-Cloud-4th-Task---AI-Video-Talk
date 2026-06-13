@@ -7,7 +7,7 @@ import time
 
 
 class ConversationContext:
-    def __init__(self, max_turns: int = 6, ttl_seconds: int = 300):
+    def __init__(self, max_turns: int = 12, ttl_seconds: int = 600):
         self.history = []  # [(role, text)]
         self.last_active = time.time()
         self.last_image_desc = ""  # 最近一次视觉识别的结果，供追问复用

@@ -235,7 +235,7 @@ window.addEventListener('load', () => {
 // 若首次碰的就是「接通」按钮，则交给 startCall，不重复念欢迎语。
 function firstInteractionFallback(e) {
   if (welcomed) return;
-  if (e.target && e.target.closest && e.target.closest('#call-btn')) return;
+  if (e.target && e.target.closest && (e.target.closest('#call-btn') || e.target.closest('#rt-btn'))) return;
   announceWelcome();
 }
 window.addEventListener('pointerdown', firstInteractionFallback);
@@ -431,9 +431,9 @@ function isVisionRequest(text) {
 // ===== 模式状态机 =====
 const MODE_NAMES = { qa: '问答模式', nav: '导航模式', read: '阅读模式', chat: '聊天模式' };
 
-function setModeIndicator() {
+function setModeIndicator(override) {
   const el = document.getElementById('mode-indicator');
-  if (el) el.textContent = MODE_NAMES[currentMode] || '问答模式';
+  if (el) el.textContent = override || MODE_NAMES[currentMode] || '问答模式';
 }
 
 function stopModeLoops() {
@@ -1087,6 +1087,7 @@ function hangup() {
   if (recorderNode) { try { recorderNode.disconnect(); } catch (e) {} }
   if (audioCtx) { try { audioCtx.close(); } catch (e) {} }
   if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  stopRealtime();   // 若在实时模式，一并清理
   document.getElementById('call').style.display = 'none';
   const su = document.getElementById('startup');
   su.style.display = 'flex';
@@ -1098,6 +1099,139 @@ function hangup() {
   answerBox.style.display = 'none';
   // 挂断不出提示音（屏幕阅读器旁白会朗读按钮状态）
   if (window.speechSynthesis) speechSynthesis.cancel();
+}
+
+// ===== ⚡ 实时模式（Qwen-Omni-Realtime）=====
+let rtActive = false, rtWS = null, rtMicCtx = null, rtMicNode = null;
+let rtPlayCtx = null, rtPlayHead = 0, rtSources = [], rtFrameTimer = null;
+const rtCanvas = document.createElement('canvas'), rtCtx2d = rtCanvas.getContext('2d');
+
+document.getElementById('rt-btn').addEventListener('click', startRealtime);
+
+async function startRealtime() {
+  welcomed = true;
+  if (window.speechSynthesis) speechSynthesis.cancel();
+  rtActive = true;
+  try {
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+  } catch (e) { rtActive = false; showPermissionError(e); return; }
+
+  document.getElementById('startup').style.opacity = '0';
+  setTimeout(() => { document.getElementById('startup').style.display = 'none'; }, 600);
+  document.getElementById('call').style.display = 'block';
+  video.srcObject = mediaStream;
+  try { await video.play(); } catch (e) {}
+  currentMode = 'qa'; setModeIndicator('⚡ 实时模式');
+  setStatus('正在连接实时对话…', '#3498db');
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  rtWS = new WebSocket(`${proto}://${location.host}/ws/realtime`);
+  rtWS.onopen = () => { rtStartMic(); rtStartFrames(); };
+  rtWS.onmessage = (ev) => rtHandle(JSON.parse(ev.data));
+  rtWS.onclose = () => { if (rtActive) setStatus('实时连接已断开', '#e74c3c'); };
+  rtWS.onerror = () => {};
+  rtPlayCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  rtPlayHead = 0;
+}
+
+// 麦克风 → 16k PCM16 → WS（持续流式，turn detection 由服务端 VAD 负责）
+function rtStartMic() {
+  rtMicCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const inRate = rtMicCtx.sampleRate;
+  const src = rtMicCtx.createMediaStreamSource(mediaStream);
+  const proc = rtMicCtx.createScriptProcessor(2048, 1, 1);
+  rtMicNode = proc;
+  proc.onaudioprocess = (e) => {
+    if (!rtWS || rtWS.readyState !== WebSocket.OPEN) return;
+    let data = e.inputBuffer.getChannelData(0);
+    if (inRate !== 16000) {
+      const ratio = inRate / 16000, n = Math.round(data.length / ratio), out = new Float32Array(n);
+      for (let i = 0; i < n; i++) { const idx = i * ratio, lo = Math.floor(idx), hi = Math.min(lo + 1, data.length - 1); out[i] = data[lo] + (data[hi] - data[lo]) * (idx - lo); }
+      data = out;
+    }
+    const buf = new ArrayBuffer(data.length * 2), view = new DataView(buf);
+    for (let i = 0; i < data.length; i++) { let s = Math.max(-1, Math.min(1, data[i])); view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true); }
+    rtWS.send(JSON.stringify({ type: 'audio', data: arrayBufferToBase64(buf) }));
+  };
+  src.connect(proc); proc.connect(rtMicCtx.destination);
+  setStatus('实时通话中 · 请直接说话', '#2ecc71');
+}
+
+// 每秒发一帧画面作为视觉上下文
+function rtStartFrames() {
+  rtFrameTimer = setInterval(() => {
+    if (!rtWS || rtWS.readyState !== WebSocket.OPEN || !video.videoWidth) return;
+    const w = 512, h = Math.round(video.videoHeight * 512 / video.videoWidth);
+    rtCanvas.width = w; rtCanvas.height = h;
+    rtCtx2d.drawImage(video, 0, 0, w, h);
+    const url = rtCanvas.toDataURL('image/jpeg', 0.6);
+    try { window.__lastFrame = url; } catch (e) {}
+    rtWS.send(JSON.stringify({ type: 'video', data: url.split(',')[1] }));
+  }, 1000);
+}
+
+function rtHandle(msg) {
+  if (msg.type === 'audio') { rtPlayChunk(msg.data); }
+  else if (msg.type === 'ai_text') {
+    answerBox.style.display = 'block';
+    if (!answerBox.querySelector('.ans')) answerBox.innerHTML = '<div class="heard"></div><div class="ans"></div>';
+    answerBox.querySelector('.ans').textContent += msg.delta || '';
+    setStatus('实时通话中 · AI 正在回答', '#9b59b6');
+  } else if (msg.type === 'user_text') {
+    answerBox.style.display = 'block';
+    if (!answerBox.querySelector('.heard')) answerBox.innerHTML = '<div class="heard"></div><div class="ans"></div>';
+    answerBox.querySelector('.heard').textContent = '🗣️ ' + (msg.text || '');
+    answerBox.querySelector('.ans').textContent = '';   // 新一轮，清空上一条回答
+  } else if (msg.type === 'user_speaking') {
+    rtStopPlayback();   // 用户开口 → 立即停掉 AI 正在播的语音（打断）
+    buzz(25);
+    setStatus('实时通话中 · 正在听你说', '#f1c40f');
+  } else if (msg.type === 'done') {
+    setStatus('实时通话中 · 请继续说', '#2ecc71');
+  } else if (msg.type === 'error') {
+    setStatus('实时识别出错，请重试', '#e74c3c');
+  }
+}
+
+// 播放一段 24k PCM16（base64）：解码后排到播放队列尾部，连续无缝播放
+function rtPlayChunk(b64) {
+  if (!rtPlayCtx) return;
+  const bin = atob(b64), len = bin.length / 2, f32 = new Float32Array(len);
+  const dv = new DataView(new ArrayBuffer(2));
+  for (let i = 0; i < len; i++) {
+    dv.setUint8(0, bin.charCodeAt(i * 2)); dv.setUint8(1, bin.charCodeAt(i * 2 + 1));
+    f32[i] = dv.getInt16(0, true) / 32768;
+  }
+  const ab = rtPlayCtx.createBuffer(1, len, 24000);
+  ab.getChannelData(0).set(f32);
+  const node = rtPlayCtx.createBufferSource();
+  node.buffer = ab; node.connect(rtPlayCtx.destination);
+  const now = rtPlayCtx.currentTime;
+  if (rtPlayHead < now) rtPlayHead = now;
+  node.start(rtPlayHead);
+  rtPlayHead += ab.duration;
+  rtSources.push(node);
+  node.onended = () => { const i = rtSources.indexOf(node); if (i >= 0) rtSources.splice(i, 1); };
+}
+
+function rtStopPlayback() {
+  rtSources.forEach(n => { try { n.stop(); } catch (e) {} });
+  rtSources = [];
+  if (rtPlayCtx) rtPlayHead = rtPlayCtx.currentTime;
+}
+
+function stopRealtime() {
+  if (!rtActive) return;
+  rtActive = false;
+  if (rtFrameTimer) { clearInterval(rtFrameTimer); rtFrameTimer = null; }
+  rtStopPlayback();
+  if (rtMicNode) { try { rtMicNode.disconnect(); } catch (e) {} rtMicNode = null; }
+  if (rtMicCtx) { try { rtMicCtx.close(); } catch (e) {} rtMicCtx = null; }
+  if (rtPlayCtx) { try { rtPlayCtx.close(); } catch (e) {} rtPlayCtx = null; }
+  if (rtWS) { try { rtWS.send(JSON.stringify({ type: 'close' })); rtWS.close(); } catch (e) {} rtWS = null; }
 }
 
 // ===== 成本面板开关 =====
