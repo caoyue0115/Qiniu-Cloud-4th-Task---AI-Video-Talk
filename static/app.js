@@ -463,9 +463,10 @@ function loadCocoSsd() {
   if (cocoLoading) return cocoLoading;
   cocoLoading = new Promise(async (resolve, reject) => {
     try {
-      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js');
-      await loadScript('https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js');
-      cocoModel = await window.cocoSsd.load({ base: 'lite_mobilenet_v2' });
+      // 全部从本地加载（经隧道由我们服务器提供），不依赖 Google/jsdelivr，国内可用
+      await loadScript('/static/vendor/tf.min.js');
+      await loadScript('/static/vendor/coco-ssd.min.js');
+      cocoModel = await window.cocoSsd.load({ modelUrl: '/static/models/coco-ssd/model.json' });
       resolve(cocoModel);
     } catch (e) { reject(e); }
   });
@@ -499,50 +500,55 @@ async function startNavigation() {
     console.warn('COCO-SSD 加载失败，仅用云端导航', e);
     speakPrompt('实时检测加载失败，将用云端导航提示。');
   }
-  // 实时检测循环
+  // 实时检测循环（独立运行，不被千问调用阻塞）
   navDetectLoop();
-  // 千问周期补充（楼梯/指示牌/路况，COCO 检测不到的）
-  modeLoopTimer = setInterval(navQwenTick, 5000);
+  // 千问周期补充（楼梯/指示牌/路况，COCO 检测不到的），频率放低避免抢占
+  modeLoopTimer = setInterval(navQwenTick, 6000);
 }
+
+let navLastAnyAlert = 0;     // 上次任意告警时间（防止告警过密）
 
 async function navDetectLoop() {
   if (!navRunning || currentMode !== 'nav') return;
-  if (cocoModel && !navDetecting && video.videoWidth && !ttsPlaying && !isProcessing) {
+  // 检测持续运行：只跳过「上一帧还没检测完」和「画面没就绪」，不被语音/千问阻塞
+  if (cocoModel && !navDetecting && video.videoWidth) {
     navDetecting = true;
     try {
-      const preds = await cocoModel.detect(video, 8);
+      const preds = await cocoModel.detect(video, 6);
       handleDetections(preds);
     } catch (e) {}
     navDetecting = false;
   }
-  if (navRunning) setTimeout(navDetectLoop, 450);
+  if (navRunning) setTimeout(navDetectLoop, 350);
 }
 
 function handleDetections(preds) {
   if (!preds || !preds.length) return;
   const vw = video.videoWidth, vh = video.videoHeight;
   const frameArea = vw * vh;
-  // 选出危险目标里「最近/最大」的一个播报，避免一次说太多
   let best = null;
   for (const p of preds) {
     const cn = NAV_CLASSES[p.class];
-    if (!cn || p.score < 0.55) continue;
+    if (!cn || p.score < 0.5) continue;
     const [x, y, w, h] = p.bbox;
     const areaRatio = (w * h) / frameArea;
-    if (areaRatio < 0.04) continue;   // 太小/太远，忽略
+    if (areaRatio < 0.035) continue;   // 太小/太远，忽略
     const cx = (x + w / 2) / vw;
-    const score = areaRatio + (Math.abs(cx - 0.5) < 0.2 ? 0.1 : 0); // 越大越居中越优先
+    const score = areaRatio + (Math.abs(cx - 0.5) < 0.2 ? 0.1 : 0);
     if (!best || score > best.score2) {
       best = { cn, zone: zoneOf(cx), areaRatio, score2: score };
     }
   }
   if (!best) return;
-  const key = best.cn + best.zone;
   const now = nowMs();
-  if (navLastAlert[key] && now - navLastAlert[key] < 4000) return;  // 4秒内不重复
+  // 全局最小间隔 2.5 秒，防止告警叠太密互相打断
+  if (now - navLastAnyAlert < 2500) return;
+  const key = best.cn + best.zone;
+  if (navLastAlert[key] && now - navLastAlert[key] < 4000) return;  // 同类同方位 4 秒不重复
   navLastAlert[key] = now;
+  navLastAnyAlert = now;
   const near = best.areaRatio > 0.22 ? '很近，' : '';
-  speakPrompt(`${best.zone}${near}有${best.cn}`);
+  speakPrompt(`${best.zone}${near}有${best.cn}`);   // 实时告警走端侧语音，即时
 }
 
 // 单调时钟（避免依赖 Date）
