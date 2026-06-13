@@ -77,6 +77,17 @@
   }
   #hangup-btn:active { transform: translateX(-50%) scale(0.92); }
 
+  /* 切换镜头按钮：放在挂断键右侧 */
+  #cam-btn {
+    position: fixed; left: calc(50% + 70px); bottom: 52px; z-index: 7;
+    width: 60px; height: 60px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(52,152,219,.92); color: #fff; font-size: 1.4rem;
+    box-shadow: 0 4px 16px rgba(0,0,0,.4); display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  }
+  #cam-btn .cam-label { font-size: 0.6rem; letter-spacing: 1px; }
+  #cam-btn:active { transform: scale(0.9); }
+
   #cost-toggle {
     position: fixed; top: 16px; right: 16px; z-index: 8;
     background: rgba(0,0,0,.5); color: #cfe3ff; border: 1px solid rgba(255,255,255,.2);
@@ -125,6 +136,7 @@
   <button id="cost-toggle">成本</button>
   <div id="cost-panel"></div>
   <div id="answer-box"></div>
+  <button id="cam-btn" title="切换镜头（含广角）">🔄<span class="cam-label">镜头</span></button>
   <button id="hangup-btn" title="挂断">📵</button>
 </div>
 

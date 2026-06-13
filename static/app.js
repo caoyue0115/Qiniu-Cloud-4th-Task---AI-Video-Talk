@@ -35,6 +35,11 @@ let silenceMs = 0;
 let speechMs = 0;
 let micSampleRate = 48000;
 
+// 摄像头切换（含广角）
+let videoDevices = [];      // 可用的后置摄像头 deviceId 列表
+let curCamIdx = 0;          // 当前镜头索引
+let switching = false;      // 切换中
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 1300;     // 停顿多久算一句结束
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -192,6 +197,58 @@ async function startCall() {
   setStatus('正在聆听…请说出你的问题', '#2ecc71');
   // 成功进入通话界面的语音提示
   speak('已接通。现在可以对准物品，直接说出你的问题，比如：这是什么。说完停顿一下，我就会回答。', { interrupt: true });
+
+  // 枚举可用摄像头（含广角），决定是否显示切换按钮
+  await setupCameras();
+}
+
+// 枚举后置摄像头。手机的广角是独立镜头，通过切换 deviceId 访问。
+async function setupCameras() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    // 优先后置镜头（label 含 back/rear/后/environment），否则全部纳入
+    let back = cams.filter(d => /back|rear|后|environment/i.test(d.label));
+    videoDevices = (back.length ? back : cams).map(d => d.deviceId).filter(Boolean);
+
+    // 当前正在用的镜头排到索引 0
+    const curId = mediaStream.getVideoTracks()[0]?.getSettings?.().deviceId;
+    const i = videoDevices.indexOf(curId);
+    if (i > 0) { videoDevices.splice(i, 1); videoDevices.unshift(curId); }
+
+    // 多于一个镜头才显示切换按钮
+    const btn = document.getElementById('cam-btn');
+    if (btn) btn.style.display = videoDevices.length > 1 ? 'flex' : 'none';
+  } catch (e) {
+    console.warn('enumerateDevices 失败', e);
+  }
+}
+
+// 切换镜头：只换视频轨，保留麦克风与 VAD 不中断
+async function switchCamera() {
+  if (switching || videoDevices.length < 2) return;
+  switching = true;
+  curCamIdx = (curCamIdx + 1) % videoDevices.length;
+  const deviceId = videoDevices[curCamIdx];
+  speak('正在切换镜头', { interrupt: true });
+  try {
+    const newStream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false
+    });
+    // 停掉旧视频轨，换上新视频轨（音频轨不动，VAD 不受影响）
+    mediaStream.getVideoTracks().forEach(t => { t.stop(); mediaStream.removeTrack(t); });
+    const newTrack = newStream.getVideoTracks()[0];
+    mediaStream.addTrack(newTrack);
+    video.srcObject = mediaStream;
+    // 第一个镜头通常是主摄，后续多为广角/长焦
+    const name = curCamIdx === 0 ? '主摄像头' : '镜头' + (curCamIdx + 1);
+    speak('已切换到' + name, { interrupt: true });
+  } catch (e) {
+    console.warn('切换镜头失败', e);
+    speak('这个镜头切换失败了', { interrupt: true });
+  }
+  switching = false;
 }
 
 function showPermissionError(e) {
@@ -440,6 +497,7 @@ function hangup() {
   su.style.display = 'flex';
   su.style.opacity = '1';
   recentFrames = []; pcmBuffer = []; recording = false; isProcessing = false; ttsPlaying = false;
+  videoDevices = []; curCamIdx = 0; switching = false;
   answerBox.style.display = 'none';
   // 挂断语音提示
   speak('通话已结束。需要时请再次点击接通按钮。', { interrupt: true });
@@ -449,3 +507,7 @@ function hangup() {
 document.getElementById('cost-toggle').addEventListener('click', () => {
   costPanel.style.display = costPanel.style.display === 'block' ? 'none' : 'block';
 });
+
+// ===== 切换镜头（含广角） =====
+const camBtn = document.getElementById('cam-btn');
+if (camBtn) camBtn.addEventListener('click', switchCamera);
