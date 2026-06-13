@@ -46,17 +46,18 @@
   .hero-left {
     position: relative; display: flex; flex-direction: column; justify-content: flex-end;
     padding: 6vh 4vw; color: #fff; overflow: hidden;
-    background: linear-gradient(160deg, #3a2a22, #1c1410);
+    background: var(--bg);   /* 暖白，无暗框，从根本上消除右边硬切割 */
   }
-  .hero-left img.bg {
-    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
-    opacity: .6; z-index: 0;
+  .hero-left img.bg {        /* 图片本身向右渐隐到透明，直接溶进白色背景 */
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 0;
+    -webkit-mask-image: linear-gradient(to right, #000 52%, transparent 90%);
+            mask-image: linear-gradient(to right, #000 52%, transparent 90%);
   }
-  .hero-left::after {   /* 底部压暗保证文字可读 + 右侧渐隐到白色，消除生硬切割 */
+  .hero-left::after {        /* 只在左下压暗给文字可读性，右侧同样渐隐，不留边 */
     content: ''; position: absolute; inset: 0; z-index: 1;
-    background:
-      linear-gradient(to right, transparent 45%, rgba(255,248,244,.6) 78%, var(--bg) 96%),
-      linear-gradient(180deg, rgba(20,12,8,.12) 0%, rgba(20,12,8,.45) 55%, rgba(20,12,8,.78) 100%);
+    background: linear-gradient(180deg, transparent 28%, rgba(20,12,8,.4) 72%, rgba(20,12,8,.7) 100%);
+    -webkit-mask-image: linear-gradient(to right, #000 48%, transparent 84%);
+            mask-image: linear-gradient(to right, #000 48%, transparent 84%);
   }
   .hero-left .inner { position: relative; z-index: 2; }
   .hero-left .eyebrow {
