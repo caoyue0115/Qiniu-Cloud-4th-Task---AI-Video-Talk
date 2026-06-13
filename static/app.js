@@ -785,7 +785,9 @@ function captureFrameNow() {
   const w = 640, h = Math.round(video.videoHeight * 640 / video.videoWidth);
   _capCanvas.width = w; _capCanvas.height = h;
   _capCtx.drawImage(video, 0, 0, w, h);
-  return _capCanvas.toDataURL('image/jpeg', 0.78);
+  const url = _capCanvas.toDataURL('image/jpeg', 0.78);
+  try { window.__lastFrame = url; } catch (e) {}   // 暴露给外层展示页显示"AI看到的画面"
+  return url;
 }
 
 function startFrameCapture() {
