@@ -8,8 +8,16 @@ APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APP_DIR"
 
 echo ">>> [1/6] 安装系统依赖..."
-apt-get update -y
-apt-get install -y python3 python3-pip python3-venv libsndfile1 libgl1 libglib2.0-0 curl
+if command -v dnf >/dev/null 2>&1; then          # 阿里云Linux / CentOS / RHEL
+  dnf install -y python3 python3-pip libsndfile mesa-libGL glib2 curl
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y python3 python3-pip libsndfile mesa-libGL glib2 curl
+elif command -v apt-get >/dev/null 2>&1; then    # Ubuntu / Debian
+  apt-get update -y
+  apt-get install -y python3 python3-pip python3-venv libsndfile1 libgl1 libglib2.0-0 curl
+else
+  echo "未识别的包管理器，请手动安装 python3/pip/libsndfile"; exit 1
+fi
 
 echo ">>> [2/6] 配置密钥 .env..."
 if [ ! -f .env ]; then
