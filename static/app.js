@@ -417,6 +417,22 @@ function handleClientCommand(text) {
   return false;
 }
 
+// 客户端识别模式进入/退出指令（与后端关键词一致），返回 'nav'|'read'|'chat'|'qa' 或 null
+function detectModeCommand(text) {
+  const t = (text || '').replace(/[，。！？、\s]/g, '');
+  if (/(退出模式|退出导航|退出阅读|退出聊天|返回问答|普通模式|问答模式|结束模式|退出|返回)/.test(t)) return 'qa';
+  if (/(导航模式|开始导航|进入导航|带我走|帮我导航)/.test(t)) return 'nav';
+  if (/(阅读模式|朗读模式|进入阅读|读这一页|阅读这个)/.test(t)) return 'read';
+  if (/(聊天模式|进入聊天|陪我聊|陪我说话|我们聊聊)/.test(t)) return 'chat';
+  return null;
+}
+
+// 识别"让它看画面"的意图（聊天模式里据此调用看图说话，二者不对立）
+function isVisionRequest(text) {
+  const t = (text || '').replace(/[，。！？、\s]/g, '');
+  return /(看看|看一下|看下|瞧瞧|帮我看|这是什么|那是什么|是什么东西|什么颜色|周围|前面|前方|有什么|读一下|念一下|描述|认一下|几个)/.test(t);
+}
+
 // ===== 模式状态机 =====
 const MODE_NAMES = { qa: '问答模式', nav: '导航模式', read: '阅读模式', chat: '聊天模式' };
 
@@ -689,6 +705,37 @@ function scheduleChat(delay) {
   chatIdleTimer = setTimeout(runChatTopic, delay);
 }
 
+// 聊天模式：自然回应用户说的话（带对话记忆），而不是描述画面
+async function chatReplyTo(userText) {
+  if (chatIdleTimer) { clearTimeout(chatIdleTimer); chatIdleTimer = null; }
+  isProcessing = true;
+  setStatus('正在回应…', '#9b59b6');
+  const frame = captureFrameNow();
+  try {
+    const resp = await fetch('/api/scene', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'chat', text: userText, frames: frame ? [frame] : [] })
+    });
+    const data = await resp.json();
+    if (data.cost) costPanel.textContent = data.cost;
+    const text = (data.text || '').trim() || '嗯，我在听，你接着说。';
+    answerBox.style.display = 'block';
+    answerBox.innerHTML = '<div class="heard">🗣️ ' + userText + '</div><div class="ans"></div>';
+    answerBox.querySelector('.ans').textContent = text;
+    lastAnswer = text;
+    buzz(60);
+    aiSpeaking = true;
+    speakPrompt(text, () => {
+      aiSpeaking = false; ttsPlaying = false; isProcessing = false;
+      setStatus('正在聆听…', '#2ecc71');
+      scheduleChat(9000);   // 回应完，过会儿可继续主动找话题
+    });
+  } catch (e) {
+    isProcessing = false; ttsPlaying = false;
+    speakPrompt('网络好像有点问题，再说一遍好吗？', () => { ttsPlaying = false; });
+  }
+}
+
 async function runChatTopic() {
   // 用 bgBusy：后台找话题不屏蔽麦克风，用户随时能说话/退出/打断
   if (currentMode !== 'chat' || bgBusy || isProcessing || recording || ttsPlaying) { scheduleChat(4000); return; }
@@ -902,8 +949,33 @@ async function finalizeUtterance() {
     wavB64 = arrayBufferToBase64(encodeWav16k(merged, micSampleRate));
   }
 
-  // 客户端语音指令（语速等）：命中则本地处理，不发给 AI
+  // 客户端语音指令（语速/重播/帮助）：命中则本地处理，不发给 AI
   if (userText && handleClientCommand(userText)) return;
+
+  // 模式感知分流：按当前模式决定怎么处理用户这句话
+  // 1) 任何模式下先识别"进入/退出模式"指令
+  if (userText) {
+    const mc = detectModeCommand(userText);
+    if (mc) { isProcessing = false; ttsPlaying = false; enterMode(mc); return; }
+  }
+  // 2) 阅读模式：任何说话都当作"重新朗读当前内容"（如"我翻页了""读一下"），绝不走看图问答
+  if (currentMode === 'read') {
+    isProcessing = false; ttsPlaying = false;
+    readPage();
+    return;
+  }
+  // 3) 聊天模式：要它看画面就走看图问答，否则自然闲聊（二者不对立）
+  if (currentMode === 'chat') {
+    if (userText && isVisionRequest(userText)) {
+      // 落到下面的 talk_stream 看图回答
+    } else if (userText) {
+      await chatReplyTo(userText); return;
+    } else {
+      isProcessing = false; ttsPlaying = false; setStatus('正在聆听…', '#2ecc71');
+      return;
+    }
+  }
+  // 4) nav / qa 模式（及聊天里的看图请求）：走看图问答（下面的 talk_stream）
 
   answerBox.style.display = 'block';
   answerBox.innerHTML = '<div class="heard">🗣️ …</div><div class="ans"></div>';
@@ -982,6 +1054,7 @@ async function finalizeUtterance() {
     aiSpeaking = false;
     isProcessing = false; ttsPlaying = false;
     setStatus('正在聆听…请继续提问', '#2ecc71');
+    if (currentMode === 'chat') scheduleChat(10000);   // 聊天里看完图，过会儿继续主动找话题
   });
 }
 

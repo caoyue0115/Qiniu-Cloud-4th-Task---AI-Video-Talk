@@ -216,6 +216,8 @@ def talk_stream(payload: dict = Body(...)):
             yield _sse({"type": "done", "cost": cost_tracker.get_report()})
             return
 
+        # 看图问答也带上最近对话记忆（与聊天共用同一 context），实现多轮追问、与聊天互通不割裂
+        ctx_before = context.as_context_string()
         context.add("user", user_text)
 
         # 缓存命中：直接整段返回
@@ -241,8 +243,13 @@ def talk_stream(payload: dict = Body(...)):
             for _ in range(max(0, extra)):
                 cost_tracker.log("full")
 
+        # 带上最近对话作为参考（支持"这个能吃吗""那再放几粒"等追问，并与聊天记忆互通）
+        q = user_text
+        if ctx_before:
+            q = f"（参考最近对话：{ctx_before}）\n用户现在说：{user_text}"
+
         full = ""
-        for delta in vision.identify_stream(img, user_text, model=model):
+        for delta in vision.identify_stream(img, q, model=model):
             full += delta
             yield _sse({"type": "delta", "text": delta})
 
@@ -299,12 +306,18 @@ def scene(payload: dict = Body(...)):
     else:  # nav
         model, mx = "mini", 80
 
-    # 聊天带上简短对话上下文，避免老重复话题
+    # 聊天：区分「用户说话→自然回应」与「主动找话题」
     user_hint = ""
     if mode == "chat":
         ctx = context.as_context_string()
-        if ctx:
-            user_hint = f"（最近的对话：{ctx}。请换个新角度，别重复。）"
+        user_said = (payload.get("text") or "").strip()
+        if user_said:
+            context.add("user", user_said)
+            user_hint = (f"用户刚对你说：「{user_said}」。请像朋友聊天一样自然地接住他这句话、聊下去，"
+                         f"重点是回应他说的内容（可以结合你看到的画面，但不要只描述画面），"
+                         f"1到2句，口语化，可以反问。最近对话：{ctx}")
+        else:
+            user_hint = f"主动找个轻松话题或评论眼前画面，引导聊下去，别重复之前说过的。最近对话：{ctx}"
 
     text = vision.describe(frames if mode == "nav" else frames[-1],
                            user_hint, prompt, model=model, max_tokens=mx)
