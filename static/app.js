@@ -40,6 +40,11 @@ let videoDevices = [];      // 可用的后置摄像头 deviceId 列表
 let curCamIdx = 0;          // 当前镜头索引
 let switching = false;      // 切换中
 
+// 模式：qa(默认问答) / nav(导航) / read(阅读) / chat(聊天)
+let currentMode = 'qa';
+let modeLoopTimer = null;   // 模式周期循环
+let chatIdleTimer = null;   // 聊天空闲计时
+
 const SILENCE_THRESHOLD = 0.012;  // 音量阈值（RMS），低于视为静音
 const SILENCE_HANG_MS = 1300;     // 停顿多久算一句结束
 const MIN_SPEECH_MS = 400;        // 至少说这么久才算有效（滤掉杂音）
@@ -249,9 +254,10 @@ async function startCall() {
 
   startFrameCapture();
   startVAD();
+  currentMode = 'qa'; setModeIndicator();
   setStatus('正在聆听…请说出你的问题', '#2ecc71');
   // 「正在聆听」提示走浏览器本地语音（即时，不受云端延迟影响）
-  speakPrompt('正在聆听，请对准物品说出您的问题');
+  speakPrompt('正在聆听，请对准物品说出您的问题。可以说导航模式、阅读模式或聊天模式来切换。');
 
   // 枚举可用摄像头（含广角），决定是否显示切换按钮
   await setupCameras();
@@ -319,6 +325,69 @@ async function switchCamera() {
     speakPrompt('这个镜头切换失败了，请再点一次试试其他镜头');
   }
   switching = false;
+}
+
+// ===== 模式状态机 =====
+const MODE_NAMES = { qa: '问答模式', nav: '导航模式', read: '阅读模式', chat: '聊天模式' };
+
+function setModeIndicator() {
+  const el = document.getElementById('mode-indicator');
+  if (el) el.textContent = MODE_NAMES[currentMode] || '问答模式';
+}
+
+function stopModeLoops() {
+  if (modeLoopTimer) { clearInterval(modeLoopTimer); modeLoopTimer = null; }
+  if (chatIdleTimer) { clearTimeout(chatIdleTimer); chatIdleTimer = null; }
+}
+
+function enterMode(mode) {
+  if (!MODE_NAMES[mode]) mode = 'qa';
+  stopModeLoops();
+  currentMode = mode;
+  setModeIndicator();
+
+  if (mode === 'qa') {
+    speakPrompt('已退出，回到问答模式。请直接说出您的问题。');
+  } else if (mode === 'chat') {
+    speakPrompt('已进入聊天模式，我们随便聊聊。', () => { ttsPlaying = false; scheduleChat(2000); });
+  } else if (mode === 'read') {
+    speakPrompt('已进入阅读模式，请把摄像头对准文字。');   // PR-B 接入循环
+  } else if (mode === 'nav') {
+    speakPrompt('已进入导航模式，我会提醒前方的危险。');   // PR-C 接入循环
+  }
+}
+
+// ===== 聊天模式：AI 主动找话题 =====
+function scheduleChat(delay) {
+  if (currentMode !== 'chat') return;
+  chatIdleTimer = setTimeout(runChatTopic, delay);
+}
+
+async function runChatTopic() {
+  if (currentMode !== 'chat' || isProcessing) { scheduleChat(4000); return; }
+  const frame = captureFrameNow();
+  if (!frame) { scheduleChat(3000); return; }
+  isProcessing = true; ttsPlaying = true;
+  try {
+    const resp = await fetch('/api/scene', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'chat', frames: [frame] })
+    });
+    const data = await resp.json();
+    if (data.cost) costPanel.textContent = data.cost;
+    const text = (data.text || '').trim();
+    if (text && currentMode === 'chat') {
+      answerBox.style.display = 'block';
+      answerBox.innerHTML = '<div class="ans"></div>';
+      answerBox.querySelector('.ans').textContent = text;
+      speak(text, { interrupt: true });   // 聊天用云端 CosyVoice，更自然
+      waitSpeechDone(() => { ttsPlaying = false; isProcessing = false; scheduleChat(9000); });
+    } else {
+      ttsPlaying = false; isProcessing = false; scheduleChat(6000);
+    }
+  } catch (e) {
+    ttsPlaying = false; isProcessing = false; scheduleChat(8000);
+  }
 }
 
 function showPermissionError(e) {
@@ -425,7 +494,9 @@ async function finalizeUtterance() {
 
   let fullAnswer = '';
   let errored = false;
+  let modeSwitch = null;   // 收到模式切换指令
 
+  // 当前模式参与请求（后端据此识别指令上下文）
   // 抓「此刻」的画面作为主画面，保证所见即所问（避免用到旧帧导致答非所见）
   const freshFrame = captureFrameNow();
   const framesToSend = recentFrames.slice();
@@ -456,6 +527,8 @@ async function finalizeUtterance() {
 
         if (evt.type === 'heard') {
           heardEl.textContent = '🗣️ ' + (evt.text || '');
+        } else if (evt.type === 'mode') {
+          modeSwitch = evt.mode;
         } else if (evt.type === 'delta') {
           fullAnswer += evt.text;
           ansEl.textContent = fullAnswer;   // 文字实时显示
@@ -473,6 +546,14 @@ async function finalizeUtterance() {
     errored = true;
     setStatus('网络出错，请重试', '#e74c3c');
     fullAnswer = '网络好像出问题了，请再说一遍。';
+  }
+
+  // 收到模式切换指令：切换模式，不走问答播报
+  if (modeSwitch) {
+    isProcessing = false;
+    enterMode(modeSwitch);
+    waitSpeechDone(() => { ttsPlaying = false; });
+    return;
   }
 
   // 回答整段一次性播报：端侧优先（更快），无本地语音时自动回退云端。
@@ -560,6 +641,7 @@ function hangup() {
   const su = document.getElementById('startup');
   su.style.display = 'flex';
   su.style.opacity = '1';
+  stopModeLoops(); currentMode = 'qa'; setModeIndicator();
   recentFrames = []; pcmBuffer = []; recording = false; isProcessing = false; ttsPlaying = false;
   videoDevices = []; curCamIdx = 0; switching = false;
   answerBox.style.display = 'none';

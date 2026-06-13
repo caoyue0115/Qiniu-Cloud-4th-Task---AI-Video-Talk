@@ -40,6 +40,7 @@ from modules.router import ModelRouter
 from modules.cache import ResponseCache
 from modules.cost_tracker import CostTracker
 from modules.context import ConversationContext
+from modules.mode_prompts import MODE_PROMPTS, detect_mode_command
 
 vision = VisionModule()
 speech = SpeechModule()
@@ -203,6 +204,14 @@ def talk_stream(payload: dict = Body(...)):
             return
 
         yield _sse({"type": "heard", "text": user_text})
+
+        # 模式指令：命中则只发模式切换事件，不走问答
+        mode_cmd = detect_mode_command(user_text)
+        if mode_cmd is not None:
+            yield _sse({"type": "mode", "mode": mode_cmd})
+            yield _sse({"type": "done", "cost": cost_tracker.get_report()})
+            return
+
         context.add("user", user_text)
 
         # 缓存命中：直接整段返回
@@ -257,6 +266,50 @@ def tts(payload: dict = Body(...)):
         return JSONResponse({"audio_mp3_b64": ""})
     cost_tracker.log("tts")
     return JSONResponse({"audio_mp3_b64": base64.b64encode(audio_bytes).decode()})
+
+
+@app.post("/api/scene")
+def scene(payload: dict = Body(...)):
+    """模式场景理解：按 mode 用不同 prompt 描述画面。
+
+    入参：{mode: 'nav'|'read'|'chat', frames: [data_url,...]}
+    返回：{text, cost}。导航无危险时 text 可能为空字符串。
+    """
+    cost_tracker.new_request()
+    mode = payload.get("mode", "")
+    prompt = MODE_PROMPTS.get(mode)
+    if not prompt:
+        return JSONResponse({"text": "", "cost": cost_tracker.get_report()})
+
+    frames_in = payload.get("frames") or []
+    frames = [_decode_data_url_image(f) for f in frames_in]
+    frames = [f for f in frames if f is not None]
+    if not frames:
+        return JSONResponse({"text": "", "cost": cost_tracker.get_report()})
+
+    # 阅读要读全文用大模型更准；导航/聊天用小模型更快更省
+    if mode == "read":
+        model, mx = "full", 400
+    elif mode == "chat":
+        model, mx = "mini", 120
+    else:  # nav
+        model, mx = "mini", 80
+
+    # 聊天带上简短对话上下文，避免老重复话题
+    user_hint = ""
+    if mode == "chat":
+        ctx = context.as_context_string()
+        if ctx:
+            user_hint = f"（最近的对话：{ctx}。请换个新角度，别重复。）"
+
+    text = vision.describe(frames if mode == "nav" else frames[-1],
+                           user_hint, prompt, model=model, max_tokens=mx)
+    cost_tracker.log("full" if model == "full" else "mini")
+
+    # 导航的"前方安全"不必每次播报，交给前端去重；这里原样返回
+    if mode == "chat" and text:
+        context.add("assistant", text)
+    return JSONResponse({"text": text or "", "cost": cost_tracker.get_report()})
 
 
 def _sse(obj: dict) -> str:
