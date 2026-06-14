@@ -9,7 +9,7 @@
 
 ## 🌐 在线体验（评委直接点开）
 
-### 👉 在线 Demo：**https://demo.ccyand.top**
+### 👉 在线 Demo：**https://talk.ccyand.top:8443**
 
 ### 🎬 演示视频：**[给我光明 — 面向视障人士的 AI 视觉对话助手（Bilibili）](https://www.bilibili.com/video/BV1MVJp68EcK/)**
 
