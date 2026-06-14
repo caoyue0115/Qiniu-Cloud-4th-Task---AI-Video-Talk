@@ -1103,6 +1103,8 @@ function hangup() {
 
 // ===== ⚡ 实时模式（Qwen-Omni-Realtime）=====
 let rtActive = false, rtWS = null, rtMicCtx = null, rtMicNode = null;
+let rtStarted = false;     // 麦克风/帧/计时只启动一次（重连不重复启动）
+let rtKeepalive = null;    // 保活定时器，防止长连接被空闲超时掐断
 let rtPlayCtx = null, rtPlayHead = 0, rtSources = [], rtFrameTimer = null;
 let rtCostTimer = null, rtStartMs = 0;
 const RT_RATE_PER_MIN = 0.1;   // flash-realtime 按token估算约¥0.1/分钟（输入音频+图片+输出音频）；前90天有100万token免费额度
@@ -1144,20 +1146,41 @@ async function startRealtime() {
   try { await video.play(); } catch (e) {}
   currentMode = 'qa'; setModeIndicator('⚡ 实时模式');
   setStatus('正在连接实时对话…', '#3498db');
+  rtPlayCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+  rtPlayHead = 0;
+  rtStarted = false;
+  rtConnectWS();
+}
 
+// 建立/重建实时 WebSocket；断开自动重连（应对空闲超时、网络抖动），用户无感
+function rtConnectWS() {
+  if (!rtActive) return;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   rtWS = new WebSocket(`${proto}://${location.host}/ws/realtime`);
   rtWS.onopen = () => {
-    rtStartMic(); rtStartFrames();
-    rtStartMs = perfNow();
-    rtUpdateCost();
-    rtCostTimer = setInterval(rtUpdateCost, 1000);   // 按时长实时更新成本
+    setStatus('实时通话中 · 请直接说话', '#2ecc71');
+    if (!rtStarted) {           // 麦克风/抓帧/计时只启动一次
+      rtStarted = true;
+      rtStartMic(); rtStartFrames();
+      rtStartMs = perfNow(); rtUpdateCost();
+      rtCostTimer = setInterval(rtUpdateCost, 1000);
+    }
+    // 保活：每 20 秒发一个 ping，避免隧道空闲超时掐断
+    if (rtKeepalive) clearInterval(rtKeepalive);
+    rtKeepalive = setInterval(() => {
+      if (rtWS && rtWS.readyState === WebSocket.OPEN) {
+        try { rtWS.send(JSON.stringify({ type: 'ping' })); } catch (e) {}
+      }
+    }, 20000);
   };
   rtWS.onmessage = (ev) => rtHandle(JSON.parse(ev.data));
-  rtWS.onclose = () => { if (rtActive) setStatus('实时连接已断开', '#e74c3c'); };
+  rtWS.onclose = () => {
+    if (rtActive) {             // 还在实时模式 → 静默重连
+      setStatus('网络波动，正在重连…', '#f1c40f');
+      setTimeout(rtConnectWS, 1200);
+    }
+  };
   rtWS.onerror = () => {};
-  rtPlayCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
-  rtPlayHead = 0;
 }
 
 // 麦克风 → 16k PCM16 → WS（持续流式，turn detection 由服务端 VAD 负责）
@@ -1198,6 +1221,10 @@ function rtStartFrames() {
 
 function rtHandle(msg) {
   if (msg.type === 'audio') { rtPlayChunk(msg.data); }
+  else if (msg.type === 'omni_closed') {
+    // Omni 会话结束 → 关掉本连接触发自动重连，开一个新会话
+    try { if (rtWS) rtWS.close(); } catch (e) {}
+  }
   else if (msg.type === 'ai_text') {
     answerBox.style.display = 'block';
     if (!answerBox.querySelector('.ans')) answerBox.innerHTML = '<div class="heard"></div><div class="ans"></div>';
@@ -1254,9 +1281,11 @@ function rtStopPlayback() {
 
 function stopRealtime() {
   if (!rtActive) return;
-  rtActive = false;
+  rtActive = false;          // 置 false 后 onclose 不再重连
+  rtStarted = false;
   if (rtFrameTimer) { clearInterval(rtFrameTimer); rtFrameTimer = null; }
   if (rtCostTimer) { clearInterval(rtCostTimer); rtCostTimer = null; }
+  if (rtKeepalive) { clearInterval(rtKeepalive); rtKeepalive = null; }
   rtStopPlayback();
   if (rtMicNode) { try { rtMicNode.disconnect(); } catch (e) {} rtMicNode = null; }
   if (rtMicCtx) { try { rtMicCtx.close(); } catch (e) {} rtMicCtx = null; }
