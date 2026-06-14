@@ -442,7 +442,7 @@ async def ws_realtime(ws: WebSocket):
             elif et == "input_audio_buffer.speech_started":
                 outq.put({"type": "user_speaking"})   # 用户开口 → 前端可停播打断
             elif et == "input_audio_buffer.committed":
-                state["audio_seen"] = False   # 本轮已提交，下一轮需重新先发音频再发图
+                state["frame"] = None   # 本轮已提交，丢弃残留画面帧，下一轮重新音频先行
             elif et == "response.done":
                 outq.put({"type": "done"})
             elif "error" in et.lower():
@@ -491,10 +491,14 @@ async def ws_realtime(ws: WebSocket):
             t = d.get("type")
             if t == "audio":
                 conv.append_audio(d.get("data", ""))
-                state["audio_seen"] = True
+                # 紧跟最近一帧画面：图像总排在音频之后、进同一缓冲区，
+                # 结构性避开"缓冲区刚提交→committed 事件尚未回传"窗口里图像先于音频的竞态
+                vid = state.get("frame")
+                if vid:
+                    conv.append_video(vid)
+                    state["frame"] = None
             elif t == "video":
-                if state.get("audio_seen"):   # Omni 要求先有音频再发图，否则报错
-                    conv.append_video(d.get("data", ""))
+                state["frame"] = d.get("data", "")   # 仅暂存，待下一个音频到达再一并发出
             elif t == "cancel":
                 try: conv.cancel_response()
                 except Exception: pass
