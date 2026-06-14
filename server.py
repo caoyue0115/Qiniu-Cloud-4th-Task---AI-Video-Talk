@@ -79,18 +79,34 @@ def _fingerprint(image) -> str:
     return hashlib.md5(small.tobytes()).hexdigest()[:16]
 
 
+import os as _os
+
+_NO_CACHE = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache"}
+
+
+def _serve_html(path, jsfiles):
+    """读 HTML，给引用的 js 自动加上 ?v=<文件修改时间> 强制刷新缓存，并禁用 HTML 缓存。"""
+    with open(path, encoding="utf-8") as f:
+        html = f.read()
+    for js in jsfiles:
+        try:
+            mt = int(_os.path.getmtime(f"static/{js}"))
+        except OSError:
+            mt = 0
+        html = html.replace(f'/static/{js}"', f'/static/{js}?v={mt}"')
+    return HTMLResponse(html, headers=_NO_CACHE)
+
+
 @app.get("/", response_class=HTMLResponse)
 def showcase():
     """展示页（评委入口）：产品介绍 + 手机样机嵌入真实 app + 实时仪表盘。"""
-    with open("static/showcase.html", encoding="utf-8") as f:
-        return f.read()
+    return _serve_html("static/showcase.html", ["showcase.js"])
 
 
 @app.get("/app", response_class=HTMLResponse)
 def app_page():
     """真实通话 app（嵌入展示页的手机样机 iframe 中运行）。"""
-    with open("static/index.html", encoding="utf-8") as f:
-        return f.read()
+    return _serve_html("static/index.html", ["app.js"])
 
 
 @app.get("/api/health")
