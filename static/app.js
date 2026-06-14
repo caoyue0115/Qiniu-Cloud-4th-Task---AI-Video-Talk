@@ -1215,9 +1215,13 @@ function rtHandle(msg) {
   } else if (msg.type === 'done') {
     setStatus('实时通话中 · 请继续说', '#2ecc71');
   } else if (msg.type === 'error') {
-    // 实时模式失败（如 key 未开通 Omni-Realtime）：明确提示改用稳定模式
-    setStatus('实时模式不可用，请挂断后用「接通」稳定模式', '#e74c3c');
-    speakPrompt('实时模式暂时不可用，请挂断后点接通，使用稳定模式。');
+    // 不再误导用户挂断；显示真实错误，便于排查（同时服务端日志也会记录）
+    const m = msg.message || '未知错误';
+    console.warn('[realtime error]', m);
+    answerBox.style.display = 'block';
+    if (!answerBox.querySelector('.ans')) answerBox.innerHTML = '<div class="heard"></div><div class="ans"></div>';
+    answerBox.querySelector('.ans').textContent = '⚠️ 实时出错：' + m;
+    setStatus('实时出错（详见上方）', '#e74c3c');
   }
 }
 

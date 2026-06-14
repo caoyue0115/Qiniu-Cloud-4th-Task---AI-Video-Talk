@@ -428,7 +428,10 @@ async def ws_realtime(ws: WebSocket):
             elif et == "response.done":
                 outq.put({"type": "done"})
             elif "error" in et.lower():
+                print(f"[omni ERROR] {e}", flush=True)   # 完整错误打进日志便于排查
                 outq.put({"type": "error", "message": str(e.get("error", e))})
+            else:
+                print(f"[omni event] {et}", flush=True)   # 其他事件类型，帮助确认模型是否在产出
 
     async def drain():
         while not state["closed"]:
