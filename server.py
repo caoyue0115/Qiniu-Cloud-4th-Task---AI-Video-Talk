@@ -441,6 +441,8 @@ async def ws_realtime(ws: WebSocket):
                 outq.put({"type": "user_text", "text": e.get("transcript", "")})
             elif et == "input_audio_buffer.speech_started":
                 outq.put({"type": "user_speaking"})   # 用户开口 → 前端可停播打断
+            elif et == "input_audio_buffer.committed":
+                state["audio_seen"] = False   # 本轮已提交，下一轮需重新先发音频再发图
             elif et == "response.done":
                 outq.put({"type": "done"})
             elif "error" in et.lower():
